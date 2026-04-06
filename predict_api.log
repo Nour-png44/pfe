@@ -1,0 +1,519 @@
+2026-03-17 10:35:12  INFO      ================================================================
+2026-03-17 10:35:12  INFO        Contact Availability — Prediction API  v2
+2026-03-17 10:35:12  INFO        Mode : JSON (dev)
+2026-03-17 10:35:12  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-17 10:35:12  INFO      ================================================================
+2026-03-18 00:37:09  INFO      ================================================================
+2026-03-18 00:37:09  INFO        Contact Availability — Prediction API  v2
+2026-03-18 00:37:09  INFO        Mode : JSON (dev)
+2026-03-18 00:37:09  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-18 00:37:09  INFO      ================================================================
+2026-03-25 12:28:07  INFO      ================================================================
+2026-03-25 12:28:07  INFO        Contact Availability — Prediction API  v2
+2026-03-25 12:28:07  INFO        Mode : JSON (dev)
+2026-03-25 12:28:07  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-25 12:28:07  INFO      ================================================================
+2026-03-25 12:28:08  INFO      Modèle chargé  version=4.0.0  entraîné=2026-03-25T11:57:07.090008
+2026-03-25 12:28:08  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.168.114:5001
+2026-03-25 12:28:08  INFO      [33mPress CTRL+C to quit[0m
+2026-03-26 20:23:02  INFO      ================================================================
+2026-03-26 20:23:02  INFO        Contact Availability — Prediction API  v2
+2026-03-26 20:23:02  INFO        Mode : JSON (dev)
+2026-03-26 20:23:02  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-26 20:23:02  INFO      ================================================================
+2026-03-26 20:23:15  INFO      Modèle chargé  version=4.0.0  entraîné=2026-03-25T11:57:07.090008
+2026-03-26 20:23:16  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.167.114:5001
+2026-03-26 20:23:16  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 14:23:25  INFO      ================================================================
+2026-03-29 14:23:25  INFO        Contact Availability — Prediction API  v4
+2026-03-29 14:23:25  INFO        Mode : JSON (dev)
+2026-03-29 14:23:25  INFO        8 features alignées avec training v5.0.0
+2026-03-29 14:23:25  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 14:23:25  INFO      ================================================================
+2026-03-29 14:23:27  INFO      Modèle chargé  version=5.0.0  entraîné=2026-03-29T14:22:01.428166
+2026-03-29 14:23:28  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-03-29 14:23:28  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 14:23:58  INFO      192.168.1.190 - - [29/Mar/2026 14:23:58] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 14:23:58  INFO      192.168.1.190 - - [29/Mar/2026 14:23:58] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-29 14:24:04  INFO      127.0.0.1 - - [29/Mar/2026 14:24:04] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 14:24:04  INFO      127.0.0.1 - - [29/Mar/2026 14:24:04] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-29 14:24:06  INFO      127.0.0.1 - - [29/Mar/2026 14:24:06] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 14:24:10  INFO      127.0.0.1 - - [29/Mar/2026 14:24:10] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 16:29:57  INFO      ================================================================
+2026-03-29 16:29:57  INFO        Contact Availability — Prediction API v4 (MongoDB uniquement)
+2026-03-29 16:29:57  INFO        MongoDB: mongodb://localhost:27017/ebsct/user
+2026-03-29 16:29:57  INFO        Modèle: C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-29 16:29:57  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 16:29:57  INFO      ================================================================
+2026-03-29 16:30:01  INFO      Modèle chargé version=5.0.0
+2026-03-29 16:30:11  INFO      MongoDB → 218225 documents chargés
+2026-03-29 16:30:11  INFO      ✅ MongoDB connecté: 218225 documents trouvés
+2026-03-29 16:30:13  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-03-29 16:30:13  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 16:30:50  INFO      ================================================================
+2026-03-29 16:30:50  INFO        Contact Availability — Prediction API v4 (MongoDB uniquement)
+2026-03-29 16:30:50  INFO        MongoDB: mongodb://localhost:27017/ebsct/user
+2026-03-29 16:30:50  INFO        Modèle: C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-29 16:30:50  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 16:30:50  INFO      ================================================================
+2026-03-29 16:30:53  INFO      Modèle chargé version=5.0.0
+2026-03-29 16:31:00  INFO      MongoDB → 218225 documents chargés
+2026-03-29 16:31:00  INFO      ✅ MongoDB connecté: 218225 documents trouvés
+2026-03-29 16:31:01  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-03-29 16:31:01  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 16:31:13  INFO      127.0.0.1 - - [29/Mar/2026 16:31:13] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 16:31:16  INFO      127.0.0.1 - - [29/Mar/2026 16:31:16] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 16:32:36  INFO      127.0.0.1 - - [29/Mar/2026 16:32:36] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 17:37:43  INFO      127.0.0.1 - - [29/Mar/2026 17:37:43] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 17:37:57  INFO      127.0.0.1 - - [29/Mar/2026 17:37:57] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 17:37:59  INFO      127.0.0.1 - - [29/Mar/2026 17:37:59] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-29 17:38:36  INFO      ================================================================
+2026-03-29 17:38:36  INFO        Contact Availability — Prediction API v4 (MongoDB uniquement)
+2026-03-29 17:38:36  INFO        MongoDB: mongodb://localhost:27017/ebsct/user
+2026-03-29 17:38:36  INFO        Modèle: C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-29 17:38:36  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 17:38:36  INFO      ================================================================
+2026-03-29 17:38:40  INFO      Modèle chargé version=5.0.0
+2026-03-29 17:38:50  INFO      MongoDB → 218225 documents chargés
+2026-03-29 17:38:50  INFO      ✅ MongoDB connecté: 218225 documents trouvés
+2026-03-29 17:38:51  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-03-29 17:38:51  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 17:39:08  INFO      127.0.0.1 - - [29/Mar/2026 17:39:08] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 17:39:12  INFO      127.0.0.1 - - [29/Mar/2026 17:39:12] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 17:39:32  INFO      127.0.0.1 - - [29/Mar/2026 17:39:32] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 17:39:33  INFO      127.0.0.1 - - [29/Mar/2026 17:39:33] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 17:39:33  INFO      127.0.0.1 - - [29/Mar/2026 17:39:33] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 17:39:47  INFO      ================================================================
+2026-03-29 17:39:47  INFO        Contact Availability — Prediction API v4 (MongoDB uniquement)
+2026-03-29 17:39:47  INFO        MongoDB: mongodb://localhost:27017/ebsct/user
+2026-03-29 17:39:47  INFO        Modèle: C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-29 17:39:47  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 17:39:47  INFO      ================================================================
+2026-03-29 17:39:50  INFO      Modèle chargé version=5.0.0
+2026-03-29 17:39:59  INFO      MongoDB → 218225 documents chargés
+2026-03-29 17:39:59  INFO      ✅ MongoDB connecté: 218225 documents trouvés
+2026-03-29 17:40:02  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-03-29 17:40:02  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 18:05:12  INFO      ================================================================
+2026-03-29 18:05:12  INFO        Contact Availability — Prediction API v4 (MongoDB uniquement)
+2026-03-29 18:05:12  INFO        MongoDB: mongodb://localhost:27017/ebsct/user
+2026-03-29 18:05:12  INFO        Modèle: C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-29 18:05:12  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 18:05:12  INFO      ================================================================
+2026-03-29 18:05:13  INFO      Modèle chargé version=5.0.0
+2026-03-29 18:05:15  INFO      MongoDB → 218225 documents chargés
+2026-03-29 18:05:15  INFO      ✅ MongoDB connecté: 218225 documents trouvés
+2026-03-29 18:05:17  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-29 18:05:17  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 18:05:20  INFO      127.0.0.1 - - [29/Mar/2026 18:05:20] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 18:05:20  INFO      127.0.0.1 - - [29/Mar/2026 18:05:20] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-29 18:05:25  INFO      192.168.43.114 - - [29/Mar/2026 18:05:25] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 18:05:25  INFO      192.168.43.114 - - [29/Mar/2026 18:05:25] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-29 18:06:28  INFO      ================================================================
+2026-03-29 18:06:28  INFO        Contact Availability — Prediction API v4 (MongoDB uniquement)
+2026-03-29 18:06:28  INFO        MongoDB: mongodb://localhost:27017/ebsct/user
+2026-03-29 18:06:28  INFO        Modèle: C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-29 18:06:28  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 18:06:28  INFO      ================================================================
+2026-03-29 18:06:30  INFO      Modèle chargé version=5.0.0
+2026-03-29 18:06:32  INFO      MongoDB → 218225 documents chargés
+2026-03-29 18:06:32  INFO      ✅ MongoDB connecté: 218225 documents trouvés
+2026-03-29 18:06:33  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-29 18:06:33  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 18:06:39  INFO      127.0.0.1 - - [29/Mar/2026 18:06:39] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 18:18:40  INFO      ================================================================
+2026-03-29 18:18:40  INFO        Contact Availability — Prediction API v4 (MongoDB uniquement)
+2026-03-29 18:18:40  INFO        MongoDB: mongodb://localhost:27017/ebsct/user
+2026-03-29 18:18:40  INFO        Modèle: C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-29 18:18:40  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 18:18:40  INFO      ================================================================
+2026-03-29 18:18:41  INFO      Modèle chargé version=5.0.0
+2026-03-29 18:18:43  INFO      MongoDB → 218225 documents chargés
+2026-03-29 18:18:43  INFO      ✅ MongoDB connecté: 218225 documents trouvés
+2026-03-29 18:18:45  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-29 18:18:45  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 18:19:33  INFO      192.168.43.114 - - [29/Mar/2026 18:19:33] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 18:19:37  INFO      127.0.0.1 - - [29/Mar/2026 18:19:37] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 18:19:37  INFO      127.0.0.1 - - [29/Mar/2026 18:19:37] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-29 19:27:39  INFO      127.0.0.1 - - [29/Mar/2026 19:27:39] "[33mGET /api/contacts HTTP/1.1[0m" 404 -
+2026-03-29 19:27:39  INFO      127.0.0.1 - - [29/Mar/2026 19:27:39] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 19:28:27  INFO        Contact Availability — Prediction API 
+2026-03-29 19:28:27  INFO        Mode : MongoDB
+2026-03-29 19:28:27  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 19:28:27  INFO      ================================================================
+2026-03-29 19:28:29  INFO      Modèle chargé  version=5.0.0  entraîné=2026-03-29T18:05:47.203405
+2026-03-29 19:28:30  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-29 19:28:30  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 19:28:40  INFO      127.0.0.1 - - [29/Mar/2026 19:28:40] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 19:28:40  INFO      127.0.0.1 - - [29/Mar/2026 19:28:40] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-29 19:28:42  INFO      127.0.0.1 - - [29/Mar/2026 19:28:42] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 19:54:09  INFO        Contact Availability — Prediction API 
+2026-03-29 19:54:09  INFO        Mode : MongoDB
+2026-03-29 19:54:09  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 19:54:09  INFO      ================================================================
+2026-03-29 19:54:10  INFO      Modèle chargé  version=5.0.0  entraîné=2026-03-29T18:05:47.203405
+2026-03-29 19:54:13  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-03-29 19:54:13  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 19:54:31  INFO      127.0.0.1 - - [29/Mar/2026 19:54:31] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 19:54:31  INFO      127.0.0.1 - - [29/Mar/2026 19:54:31] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-29 19:54:37  INFO      127.0.0.1 - - [29/Mar/2026 19:54:37] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 19:54:38  INFO      127.0.0.1 - - [29/Mar/2026 19:54:38] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-29 19:55:06  INFO      127.0.0.1 - - [29/Mar/2026 19:55:06] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 19:55:07  INFO      127.0.0.1 - - [29/Mar/2026 19:55:07] "[33mGET /api/contacts HTTP/1.1[0m" 404 -
+2026-03-29 19:57:49  INFO        Contact Availability — Prediction API 
+2026-03-29 19:57:49  INFO        Mode : MongoDB
+2026-03-29 19:57:49  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 19:57:49  INFO      ================================================================
+2026-03-29 19:57:50  INFO      Modèle chargé  version=5.0.0  entraîné=2026-03-29T19:54:15.495620
+2026-03-29 19:57:52  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-03-29 19:57:52  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 19:58:01  INFO      127.0.0.1 - - [29/Mar/2026 19:58:01] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 19:58:01  INFO      127.0.0.1 - - [29/Mar/2026 19:58:01] "GET /api/contacts HTTP/1.1" 200 -
+2026-03-29 19:58:19  INFO        Contact Availability — Prediction API 
+2026-03-29 19:58:19  INFO        Mode : MongoDB
+2026-03-29 19:58:19  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 19:58:19  INFO      ================================================================
+2026-03-29 19:58:20  INFO      Modèle chargé  version=5.0.0  entraîné=2026-03-29T19:54:15.495620
+2026-03-29 19:58:22  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-03-29 19:58:22  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 19:58:29  INFO      127.0.0.1 - - [29/Mar/2026 19:58:29] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 19:58:29  INFO      127.0.0.1 - - [29/Mar/2026 19:58:29] "GET /api/contacts HTTP/1.1" 200 -
+2026-03-29 19:58:51  INFO      127.0.0.1 - - [29/Mar/2026 19:58:51] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-29 19:58:51  INFO      POST /api/predict  msisdns=22
+2026-03-29 19:58:58  INFO      → total=22 available=22 suspected=0 na=0 (6765ms)
+2026-03-29 19:58:58  INFO      127.0.0.1 - - [29/Mar/2026 19:58:58] "POST /api/predict HTTP/1.1" 200 -
+2026-03-29 20:00:36  INFO      127.0.0.1 - - [29/Mar/2026 20:00:36] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-29 20:00:36  INFO      POST /api/predict  msisdns=30
+2026-03-29 20:00:43  INFO      → total=30 available=30 suspected=0 na=0 (7222ms)
+2026-03-29 20:00:44  INFO      127.0.0.1 - - [29/Mar/2026 20:00:44] "POST /api/predict HTTP/1.1" 200 -
+2026-03-29 20:00:58  INFO      127.0.0.1 - - [29/Mar/2026 20:00:58] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-29 20:00:58  INFO      POST /api/predict  msisdns=30
+2026-03-29 20:01:05  INFO      → total=30 available=30 suspected=0 na=0 (7429ms)
+2026-03-29 20:01:06  INFO      127.0.0.1 - - [29/Mar/2026 20:01:06] "POST /api/predict HTTP/1.1" 200 -
+2026-03-29 20:03:11  INFO      127.0.0.1 - - [29/Mar/2026 20:03:11] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 20:03:11  INFO      127.0.0.1 - - [29/Mar/2026 20:03:11] "GET /api/contacts HTTP/1.1" 200 -
+2026-03-29 20:03:19  INFO      127.0.0.1 - - [29/Mar/2026 20:03:19] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-29 20:03:19  INFO      POST /api/predict  msisdns=8
+2026-03-29 20:03:25  INFO      → total=8 available=8 suspected=0 na=0 (5927ms)
+2026-03-29 20:03:25  INFO      127.0.0.1 - - [29/Mar/2026 20:03:25] "POST /api/predict HTTP/1.1" 200 -
+2026-03-29 21:15:18  INFO        Contact Availability — Prediction API 
+2026-03-29 21:15:18  INFO        Mode : MongoDB
+2026-03-29 21:15:18  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 21:15:18  INFO      ================================================================
+2026-03-29 21:15:23  INFO      Modèle chargé  version=5.0.0  entraîné=2026-03-29T19:54:15.495620
+2026-03-29 21:15:24  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-03-29 21:15:24  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 21:15:36  INFO      127.0.0.1 - - [29/Mar/2026 21:15:36] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 21:15:36  INFO      127.0.0.1 - - [29/Mar/2026 21:15:36] "GET /api/contacts HTTP/1.1" 200 -
+2026-03-29 21:28:44  INFO      127.0.0.1 - - [29/Mar/2026 21:28:44] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-29 21:28:44  INFO      POST /api/predict  msisdns=22
+2026-03-29 21:28:55  INFO      → total=22 available=22 suspected=0 na=0 (10843ms)
+2026-03-29 21:28:55  INFO      127.0.0.1 - - [29/Mar/2026 21:28:55] "POST /api/predict HTTP/1.1" 200 -
+2026-03-29 23:49:24  INFO        Contact Availability — Prediction API 
+2026-03-29 23:49:24  INFO        Mode : MongoDB
+2026-03-29 23:49:24  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 23:49:24  INFO      ================================================================
+2026-03-29 23:49:28  INFO      Modèle chargé  version=5.0.0  entraîné=2026-03-29T19:54:15.495620
+2026-03-29 23:49:29  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-29 23:49:29  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 23:50:19  INFO        Contact Availability — Prediction API 
+2026-03-29 23:50:19  INFO        Mode : MongoDB
+2026-03-29 23:50:19  INFO        Écoute sur http://0.0.0.0:5001
+2026-03-29 23:50:19  INFO      ================================================================
+2026-03-29 23:50:23  INFO      Modèle chargé  version=5.0.0  entraîné=2026-03-29T19:54:15.495620
+2026-03-29 23:50:24  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-29 23:50:24  INFO      [33mPress CTRL+C to quit[0m
+2026-03-29 23:50:36  INFO      127.0.0.1 - - [29/Mar/2026 23:50:36] "GET /api/health HTTP/1.1" 200 -
+2026-03-29 23:50:36  INFO      127.0.0.1 - - [29/Mar/2026 23:50:36] "GET /api/contacts HTTP/1.1" 200 -
+2026-03-29 23:50:50  INFO      127.0.0.1 - - [29/Mar/2026 23:50:50] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-29 23:50:50  INFO      POST /api/predict  msisdns=22
+2026-03-29 23:51:01  ERROR     Exception on /api/predict [POST]
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 919, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask_cors\extension.py", line 176, in wrapped_function
+    return cors_after_request(app.make_response(f(*args, **kwargs)))
+                                                ~^^^^^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict_api.py", line 384, in predict
+    row = build_features_from_history(msisdn, history)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict_api.py", line 203, in build_features_from_history
+    for h in norm_history:  # ← normalisé
+             ^^^^^^^^^^^^
+TypeError: 'NoneType' object is not iterable
+2026-03-29 23:51:01  INFO      127.0.0.1 - - [29/Mar/2026 23:51:01] "[35m[1mPOST /api/predict HTTP/1.1[0m" 500 -
+2026-03-29 23:51:07  INFO      127.0.0.1 - - [29/Mar/2026 23:51:07] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-29 23:51:07  INFO      POST /api/predict  msisdns=22
+2026-03-29 23:51:15  ERROR     Exception on /api/predict [POST]
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 919, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask_cors\extension.py", line 176, in wrapped_function
+    return cors_after_request(app.make_response(f(*args, **kwargs)))
+                                                ~^^^^^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict_api.py", line 384, in predict
+    row = build_features_from_history(msisdn, history)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict_api.py", line 203, in build_features_from_history
+    for h in norm_history:  # ← normalisé
+             ^^^^^^^^^^^^
+TypeError: 'NoneType' object is not iterable
+2026-03-29 23:51:15  INFO      127.0.0.1 - - [29/Mar/2026 23:51:15] "[35m[1mPOST /api/predict HTTP/1.1[0m" 500 -
+2026-03-30 13:06:37  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 13:06:37  INFO        Mode    : MongoDB
+2026-03-30 13:06:37  INFO        Écoute  : http://0.0.0.0:5001
+2026-03-30 13:06:37  INFO        Features: ['total_envois', 'taux_livraison', 'echecs_consecutifs_max', 'jours_depuis_succes', 'score_recence', 'taux_livraison_recent', 'freq_inter_envoi_jours']
+2026-03-30 13:06:37  INFO      ==================================================
+2026-03-30 13:06:40  INFO      Modèle chargé v=? entraîné=?
+2026-03-30 13:06:41  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-30 13:06:41  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 13:07:27  INFO      127.0.0.1 - - [30/Mar/2026 13:07:27] "GET /api/health HTTP/1.1" 200 -
+2026-03-30 13:07:27  INFO      127.0.0.1 - - [30/Mar/2026 13:07:27] "GET /api/contacts HTTP/1.1" 200 -
+2026-03-30 13:07:37  INFO      127.0.0.1 - - [30/Mar/2026 13:07:37] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-30 13:07:37  INFO      POST /api/predict  msisdns=22
+2026-03-30 13:07:45  ERROR     Exception on /api/predict [POST]
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 919, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask_cors\extension.py", line 176, in wrapped_function
+    return cors_after_request(app.make_response(f(*args, **kwargs)))
+                                                ~^^^^^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict_api.py", line 380, in predict
+    predicted = predict_contacts(rows_hist, pkg)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict_api.py", line 266, in predict_contacts
+    xgb_model  = pkg['xgboost_model']
+                 ~~~^^^^^^^^^^^^^^^^^
+KeyError: 'xgboost_model'
+2026-03-30 13:07:45  INFO      127.0.0.1 - - [30/Mar/2026 13:07:45] "[35m[1mPOST /api/predict HTTP/1.1[0m" 500 -
+2026-03-30 13:08:15  INFO      127.0.0.1 - - [30/Mar/2026 13:08:15] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-30 13:08:15  INFO      POST /api/predict  msisdns=22
+2026-03-30 13:08:23  ERROR     Exception on /api/predict [POST]
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 1511, in wsgi_app
+    response = self.full_dispatch_request()
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 919, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask_cors\extension.py", line 176, in wrapped_function
+    return cors_after_request(app.make_response(f(*args, **kwargs)))
+                                                ~^^^^^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 917, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\flask\app.py", line 902, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict_api.py", line 380, in predict
+    predicted = predict_contacts(rows_hist, pkg)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict_api.py", line 266, in predict_contacts
+    xgb_model  = pkg['xgboost_model']
+                 ~~~^^^^^^^^^^^^^^^^^
+KeyError: 'xgboost_model'
+2026-03-30 13:08:23  INFO      127.0.0.1 - - [30/Mar/2026 13:08:23] "[35m[1mPOST /api/predict HTTP/1.1[0m" 500 -
+2026-03-30 13:16:17  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 13:16:17  INFO        Mode    : MongoDB
+2026-03-30 13:16:17  INFO        Écoute  : http://0.0.0.0:5001
+2026-03-30 13:16:17  INFO        Features: ['total_envois', 'taux_livraison', 'echecs_consecutifs_max', 'jours_depuis_succes', 'score_recence', 'taux_livraison_recent', 'freq_inter_envoi_jours']
+2026-03-30 13:16:17  INFO      ==================================================
+2026-03-30 13:16:20  INFO      Modèle chargé v=6.0.0 entraîné=2026-03-30T13:16:03.013333
+2026-03-30 13:16:22  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-30 13:16:22  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 13:16:28  INFO      127.0.0.1 - - [30/Mar/2026 13:16:28] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-30 13:16:28  INFO      127.0.0.1 - - [30/Mar/2026 13:16:28] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-30 13:19:54  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 13:19:54  INFO        Écoute : http://0.0.0.0:5001
+2026-03-30 13:19:56  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-30 13:19:56  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 13:41:38  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 13:41:38  INFO      Écoute sur http://0.0.0.0:5001
+2026-03-30 13:41:40  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-30 13:41:40  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 13:41:49  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 13:41:49  INFO      Écoute sur http://0.0.0.0:5001
+2026-03-30 13:41:51  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-30 13:41:51  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 13:46:17  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 13:46:17  INFO      Écoute sur http://127.0.0.1:5001
+2026-03-30 13:46:17  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5001
+2026-03-30 13:46:17  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 13:48:40  INFO      127.0.0.1 - - [30/Mar/2026 13:48:40] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-30 13:48:40  INFO      127.0.0.1 - - [30/Mar/2026 13:48:40] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-30 13:57:06  INFO      Modèle chargé avec succès.
+2026-03-30 13:57:45  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 13:57:45  INFO      Écoute sur http://127.0.0.1:5001
+2026-03-30 13:57:45  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5001
+2026-03-30 13:57:45  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 13:58:03  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 13:58:03  INFO      Écoute sur http://127.0.0.1:5001
+2026-03-30 13:58:03  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5001
+2026-03-30 13:58:03  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 13:58:15  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 13:58:15  INFO      Écoute sur http://127.0.0.1:5001
+2026-03-30 13:58:15  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5001
+2026-03-30 13:58:15  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 13:59:33  INFO      Modèle chargé avec succès.
+2026-03-30 13:59:33  INFO      1 contacts prédits et sauvegardés dans C:\Users\nour2\Downloads\PythonProject\PFE\outputs\last_api_predictions.csv
+2026-03-30 13:59:53  INFO      Modèle chargé avec succès.
+2026-03-30 13:59:53  INFO      1 contacts prédits et sauvegardés dans C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-30 14:01:57  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 14:01:57  INFO      Écoute sur http://127.0.0.1:5001
+2026-03-30 14:01:57  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5001
+2026-03-30 14:01:57  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 14:16:48  INFO      ===== Contact Availability API v6.0.0 =====
+2026-03-30 14:16:48  INFO      Écoute sur http://127.0.0.1:5001
+2026-03-30 14:16:48  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5001
+2026-03-30 14:16:48  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 14:34:59  INFO      ===== Contact Availability API v7.0.0 =====
+2026-03-30 14:34:59  INFO        Mode    : MongoDB
+2026-03-30 14:34:59  INFO        Écoute  : http://0.0.0.0:5001
+2026-03-30 14:34:59  INFO        Features: ['total_envois', 'taux_livraison', 'echecs_consecutifs_max', 'jours_depuis_succes', 'score_recence', 'taux_livraison_recent', 'freq_inter_envoi_jours']
+2026-03-30 14:34:59  INFO      ==================================================
+2026-03-30 14:35:01  INFO      Modèle chargé v=7.0.0 entraîné=2026-03-30T14:22:58.538309
+2026-03-30 14:35:02  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.43.114:5001
+2026-03-30 14:35:02  INFO      [33mPress CTRL+C to quit[0m
+2026-03-30 14:35:10  INFO      127.0.0.1 - - [30/Mar/2026 14:35:10] "GET /api/health HTTP/1.1" 200 -
+2026-03-30 14:35:10  INFO      127.0.0.1 - - [30/Mar/2026 14:35:10] "GET /api/contacts HTTP/1.1" 200 -
+2026-03-30 14:35:18  INFO      127.0.0.1 - - [30/Mar/2026 14:35:18] "GET /api/contacts HTTP/1.1" 200 -
+2026-03-30 14:35:18  INFO      127.0.0.1 - - [30/Mar/2026 14:35:18] "GET /api/health HTTP/1.1" 200 -
+2026-03-30 14:35:28  INFO      127.0.0.1 - - [30/Mar/2026 14:35:28] "OPTIONS /api/predict HTTP/1.1" 200 -
+2026-03-30 14:35:28  INFO      POST /api/predict  msisdns=7
+2026-03-30 14:35:28  INFO      → total=7 avail=7 susp=0 na=0 (303ms)
+2026-03-30 14:35:28  INFO      127.0.0.1 - - [30/Mar/2026 14:35:28] "POST /api/predict HTTP/1.1" 200 -
+2026-04-01 13:43:10  INFO      ===== Contact Availability API v7.0.0 =====
+2026-04-01 13:43:10  INFO        Mode    : MongoDB
+2026-04-01 13:43:10  INFO        Écoute  : http://0.0.0.0:5001
+2026-04-01 13:43:10  INFO        Features: ['total_envois', 'taux_livraison', 'echecs_consecutifs_max', 'jours_depuis_succes', 'score_recence', 'taux_livraison_recent', 'freq_inter_envoi_jours']
+2026-04-01 13:43:10  INFO      ==================================================
+2026-04-01 13:43:22  INFO      Modèle chargé v=7.0.0 entraîné=2026-03-30T14:37:22.187478
+2026-04-01 13:43:23  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://192.168.1.190:5001
+2026-04-01 13:43:23  INFO      [33mPress CTRL+C to quit[0m
+2026-04-01 13:44:17  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on http://127.0.0.1:5000
+2026-04-01 13:44:17  INFO      [33mPress CTRL+C to quit[0m
+2026-04-01 14:05:46  INFO      POST /api/predict  msisdns=3
+2026-04-01 14:05:46  INFO      → total=3 avail=1 susp=1 na=1 (1ms)
+2026-04-03 15:01:28  INFO      POST /api/predict  msisdns=3
+2026-04-03 15:01:28  INFO      → total=3 avail=1 susp=1 na=1 (1ms)
+2026-04-04 12:50:32  INFO      NumExpr defaulting to 16 threads.
+2026-04-04 12:50:44  INFO      POST /api/predict  msisdns=3
+2026-04-04 12:50:44  INFO      → total=3 avail=1 susp=1 na=1 (1ms)
+2026-04-04 12:50:44  INFO      BLOC 1B — 3 valides | 1 rejetés
+2026-04-04 12:50:44  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-04 12:50:44  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:1
+2026-04-04 12:50:44  INFO        Statuts nettoyés:0 | Inconnus:0 | Doublons:1
+2026-04-04 12:50:44  INFO      BLOC 1C — 1 événements normalisés (4→2, 8→2)
+2026-04-04 12:50:44  INFO      BLOC 1C — 1 MSISDNs uniques
+2026-04-04 12:50:44  INFO      BLOC 1B — 1 valides | 0 rejetés
+2026-04-04 12:50:44  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-04 12:50:44  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:0
+2026-04-04 12:50:44  INFO        Statuts nettoyés:0 | Inconnus:0 | Doublons:0
+2026-04-04 12:51:10  INFO      NumExpr defaulting to 16 threads.
+2026-04-04 12:51:11  INFO      POST /api/predict  msisdns=3
+2026-04-04 12:51:11  INFO      → total=3 avail=1 susp=1 na=1 (0ms)
+2026-04-04 12:51:11  INFO      BLOC 1B — 3 valides | 1 rejetés
+2026-04-04 12:51:11  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-04 12:51:11  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:1
+2026-04-04 12:51:11  INFO      BLOC 1C — 1 événements normalisés (4→2, 8→2)
+2026-04-04 12:51:11  INFO      BLOC 1C — 1 MSISDNs uniques
+2026-04-04 12:51:11  INFO      BLOC 1B — 1 valides | 0 rejetés
+2026-04-04 12:51:11  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-04 12:51:11  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:0
+2026-04-04 15:01:33  INFO      POST /api/predict  msisdns=3
+2026-04-04 15:01:33  INFO      → total=3 avail=1 susp=1 na=1 (1ms)
+2026-04-04 15:02:02  INFO      POST /api/predict  msisdns=3
+2026-04-04 15:02:02  INFO      → total=3 avail=1 susp=1 na=1 (0ms)

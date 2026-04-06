@@ -1,0 +1,11 @@
+{
+  "accuracy": 0.9545,
+  "precision_macro": 0.9833,
+  "recall_macro": 0.8333,
+  "f1_macro": 0.8803,
+  "auc_roc_macro": 0.9775,
+  "test_split_size": 0.2,
+  "test_split_seed": 42,
+  "n_test_samples": 22,
+  "evaluated_at": "2026-04-06T14:25:06.172938"
+}

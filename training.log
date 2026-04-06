@@ -1,0 +1,2502 @@
+"""
+PHASE TRAINING — train_model.py
+================================
+Ce fichier entraîne les modèles XGBoost et Cox.
+Il lit l'historique SMS depuis MongoDB,
+calcule des statistiques pour chaque numéro de téléphone,
+entraîne les modèles, et sauvegarde le résultat dans model.pkl.
+"""
+
+# ── Imports ────────────────────────────────────────────────────
+import os
+import json
+import pickle
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy  as np
+import pandas as pd
+
+from datetime        import datetime
+from pymongo         import MongoClient
+from lifelines       import CoxPHFitter
+from lifelines.utils import concordance_index
+from xgboost         import XGBClassifier
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import (accuracy_score, precision_score,
+                             recall_score, f1_score,
+                             roc_auc_score, classification_report)
+
+# ── Chemins et paramètres ──────────────────────────────────────
+MONGO_URI       = "mongodb://localhost:27017"
+MONGO_DB        = "easybulk"
+MONGO_COL_INPUT = "user_contact"
+
+# Chemin vers le dossier du projet
+BASE_DIR   = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+MODEL_PATH = os.path.join(BASE_DIR, "models", "xgboost", "model.pkl")
+JSON_PATH  = os.path.join(BASE_DIR, "data", "user_contact.json")
+os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+
+# Statuts DLR considérés comme un succès de livraison
+STATUTS_SUCCES = [1, 16]
+
+# Toutes les features utilisées pour entraîner XGBoost
+FEATURE_COLS = [
+    "total_sms_envoyes",
+    "delivery_rate",
+    "failure_rate",
+    "echecs_consecutifs",
+    "jours_depuis_dernier_succes",
+    "recency_score",
+    "time_decay_score",
+    "dernier_statut",
+    "dernier_est_succes",
+    "jours_depuis_envoi",
+    "heure_envoi",
+    "jour_semaine",
+    "ratio_buffered",
+    "ratio_rejected",
+    "ratio_undeliverable",
+    "is_utf16",
+    "cost",
+    "p_na_7j",    # sortie Cox
+    "p_na_30j",   # sortie Cox
+]
+
+
+# ══════════════════════════════════════════════════════════════
+# ÉTAPE 1 — DATA EXTRACTION
+# Lire les données depuis MongoDB (ou le fichier JSON)
+# ══════════════════════════════════════════════════════════════
+def data_extraction():
+    print("\n[ÉTAPE 1] Data Extraction")
+    print("  → Lecture de l'historique DLR depuis MongoDB")
+
+    records = []
+
+    # Essayer de se connecter à MongoDB
+    try:
+        client  = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+        client.server_info()  # teste la connexion
+        db      = client[MONGO_DB]
+        records = list(db[MONGO_COL_INPUT].find({}, {"_id": 0}))
+        client.close()
+        print(f"  ✅ MongoDB OK — {len(records)} documents lus")
+
+    except Exception:
+        # MongoDB non disponible → lire le fichier JSON local
+        print("  ⚠️  MongoDB non disponible → lecture du fichier JSON")
+        with open(JSON_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except:
+                        continue
+        print(f"  ✅ JSON OK — {len(records)} documents lus")
+
+    return records
+
+
+# ══════════════════════════════════════════════════════════════
+# ÉTAPE 2 — DATA CLEANING
+# Nettoyer les données et regrouper par numéro
+# ══════════════════════════════════════════════════════════════
+def data_cleaning(records):
+    print("\n[ÉTAPE 2] Data Cleaning")
+    print("  → Suppression des données invalides")
+    print("  → Regroupement par numéro de téléphone (MSISDN)")
+
+    avant = len(records)
+
+    # Garder uniquement les documents valides
+    records = [
+        r for r in records
+        if r.get("msisdn")                                   # a un numéro
+        and isinstance(r.get("status_history"), list)        # a un historique
+        and len(r["status_history"]) > 0                     # historique non vide
+    ]
+    print(f"  Documents avant  : {avant}")
+    print(f"  Documents après  : {len(records)} ({avant - len(records)} supprimés)")
+
+    # Regrouper tous les SMS du même numéro ensemble
+    # (un numéro peut avoir reçu des SMS de plusieurs campagnes)
+    contacts = {}
+    for doc in records:
+        msisdn = str(doc["msisdn"]).strip()
+
+        if msisdn not in contacts:
+            contacts[msisdn] = {
+                "msisdn"        : msisdn,
+                "encoding"      : doc.get("encoding", "GSM_7BIT"),
+                "cost_list"     : [],
+                "status_history": [],
+                "nb_messages"   : 0,
+            }
+
+        contacts[msisdn]["nb_messages"] += 1
+        contacts[msisdn]["cost_list"].append(doc.get("cost", 1))
+        contacts[msisdn]["status_history"].extend(doc["status_history"])
+
+    print(f"  Numéros uniques  : {len(contacts)}")
+    return contacts
+
+
+# ══════════════════════════════════════════════════════════════
+# ÉTAPE 3 — NORMALISATION DES STATUTS
+# Garder uniquement les statuts connus et les nommer clairement
+# ══════════════════════════════════════════════════════════════
+def normalisation_statuts(contacts):
+    print("\n[ÉTAPE 3] Normalisation des statuts")
+    print("  → Conversion des codes statuts en noms clairs")
+
+    # Table de correspondance code → nom
+    STATUTS = {
+        1 : "DELIVERED",      # ✅ SMS reçu par le destinataire
+        16: "SMSC_ACK",       # ✅ Accepté par le réseau
+        8 : "BUFFERED",       # ⏳ Téléphone éteint, SMS en attente
+        4 : "REJECTED",       # ❌ Rejeté par l'opérateur
+        2 : "UNDELIVERABLE",  # ❌ Numéro invalide ou inexistant
+        34: "EXPIRED",        # ❌ Délai dépassé, SMS expiré
+    }
+
+    contacts_norm = {}
+    compteur = {}  # pour afficher les stats
+
+    for msisdn, data in contacts.items():
+        historique_propre = []
+
+        for s in data["status_history"]:
+            code = s.get("status")
+            date = s.get("status_last_updated_at")
+
+            # Garder uniquement les statuts connus
+            if code in STATUTS:
+                historique_propre.append({
+                    "status"                : int(code),
+                    "status_nom"            : STATUTS[code],
+                    "status_last_updated_at": date,
+                })
+                compteur[code] = compteur.get(code, 0) + 1
+
+        # Garder le contact uniquement s'il a au moins 2 statuts
+        if len(historique_propre) >= 2:
+            contacts_norm[msisdn] = {**data, "status_history": historique_propre}
+
+    # Afficher la distribution
+    total = sum(compteur.values())
+    print(f"  Contacts valides : {len(contacts_norm)}")
+    print(f"  Distribution des statuts :")
+    for code, cnt in sorted(compteur.items(), key=lambda x: -x[1]):
+        print(f"    {code:>2} {STATUTS[code]:<15} : {cnt:>5}  ({cnt/total*100:.1f}%)")
+
+    return contacts_norm
+
+
+# ══════════════════════════════════════════════════════════════
+# ÉTAPE 4 — FEATURE ENGINEERING
+# Calculer les statistiques de chaque numéro de téléphone
+# Ce sont ces statistiques que XGBoost et Cox vont utiliser
+# ══════════════════════════════════════════════════════════════
+def feature_engineering(contacts_norm):
+    print("\n[ÉTAPE 4] Feature Engineering")
+    print("  → Calcul des statistiques pour chaque numéro")
+
+    NOW = pd.Timestamp(datetime.now())
+    lignes = []  # contiendra une ligne par contact
+
+    for msisdn, data in contacts_norm.items():
+
+        # Convertir l'historique en DataFrame pour faire des calculs
+        hist = pd.DataFrame(data["status_history"])
+        hist["status_last_updated_at"] = pd.to_datetime(
+            hist["status_last_updated_at"], errors="coerce"
+        )
+        hist = hist.dropna(subset=["status_last_updated_at"])
+        hist = hist.sort_values("status_last_updated_at").reset_index(drop=True)
+
+        if len(hist) < 2:
+            continue
+
+        # Première et dernière date dans l'historique
+        t_debut = hist["status_last_updated_at"].iloc[0]
+        t_fin   = hist["status_last_updated_at"].iloc[-1]
+        duree   = max((t_fin - t_debut).total_seconds() / 60.0, 0.1)
+
+        # F1 — Total SMS envoyés
+        # Combien de fois ce numéro a reçu un SMS
+        total_sms_envoyes = data["nb_messages"]
+
+        # F2 — Delivery rate (taux de livraison)
+        # Proportion de SMS qui ont bien été livrés
+        nb_livres     = hist["status"].isin(STATUTS_SUCCES).sum()
+        delivery_rate = round(nb_livres / len(hist), 4)
+
+        # F3 — Failure rate (taux d'échec)
+        # Proportion de SMS qui n'ont PAS été livrés
+        failure_rate = round(1 - delivery_rate, 4)
+
+        # F4 — Échecs consécutifs
+        # Combien de SMS d'affilée ont échoué à la FIN de l'historique
+        # Exemple : [livré, livré, échec, échec, échec] → 3
+        # Si ce nombre est grand, le contact est probablement injoignable
+        echecs_consecutifs = 0
+        for s in reversed(hist["status"].tolist()):
+            if s not in STATUTS_SUCCES:
+                echecs_consecutifs += 1
+            else:
+                break  # on s'arrête dès qu'on trouve un succès
+
+        # F5 — Jours depuis le dernier succès
+        # Depuis combien de jours ce numéro n'a pas reçu de SMS avec succès
+        # Si très grand (999) → jamais livré ou très longtemps inaccessible
+        sms_livres = hist[hist["status"].isin(STATUTS_SUCCES)]
+        if len(sms_livres) > 0:
+            derniere_livraison = sms_livres["status_last_updated_at"].max()
+            jours_depuis_dernier_succes = round(
+                (NOW - derniere_livraison).total_seconds() / 86400.0, 2
+            )
+        else:
+            jours_depuis_dernier_succes = 999.0  # jamais livré
+
+        # F6 — Recency score
+        # Score entre 0 et 1 :
+        #   proche de 1 = dernier succès très récent → contact joignable
+        #   proche de 0 = dernier succès très ancien → contact injoignable
+        recency_score = round(
+            np.exp(-0.1 * jours_depuis_dernier_succes), 6
+        )
+
+        # F7 — Time Decay score
+        # Somme des succès passés, pondérés par leur ancienneté
+        # Un succès d'hier compte PLUS qu'un succès d'il y a 6 mois
+        # Formule : Σ exp(-0.1 × jours) pour chaque SMS livré
+        time_decay_score = 0.0
+        for _, row in hist.iterrows():
+            jours = (NOW - row["status_last_updated_at"]).total_seconds() / 86400.0
+            if row["status"] in STATUTS_SUCCES:
+                time_decay_score += np.exp(-0.1 * jours)
+        time_decay_score = round(time_decay_score / (len(hist) + 1e-9), 8)
+
+        # ── Autres features utiles ─────────────────────────────
+
+        # Dernier statut DLR (ex: 1=livré, 2=invalide, 4=rejeté...)
+        dernier_statut = int(hist["status"].iloc[-1])
+
+        # 1 si le dernier SMS a été livré, 0 sinon
+        dernier_est_succes = 1 if dernier_statut in STATUTS_SUCCES else 0
+
+        # Depuis combien de jours le dernier SMS a été envoyé
+        jours_depuis_envoi = round((NOW - t_fin).total_seconds() / 86400.0, 2)
+
+        # Ratios des différents types de statuts
+        ratio_buffered      = round((hist["status"] == 8).mean(), 4)
+        ratio_rejected      = round((hist["status"] == 4).mean(), 4)
+        ratio_undeliverable = round((hist["status"] == 2).mean(), 4)
+
+        # Ajouter une ligne pour ce contact
+        lignes.append({
+            "msisdn"                     : msisdn,
+            "total_sms_envoyes"          : total_sms_envoyes,
+            "delivery_rate"              : delivery_rate,
+            "failure_rate"               : failure_rate,
+            "echecs_consecutifs"         : echecs_consecutifs,
+            "jours_depuis_dernier_succes": jours_depuis_dernier_succes,
+            "recency_score"              : recency_score,
+            "time_decay_score"           : time_decay_score,
+            "dernier_statut"             : dernier_statut,
+            "dernier_est_succes"         : dernier_est_succes,
+            "jours_depuis_envoi"         : jours_depuis_envoi,
+            "heure_envoi"                : t_debut.hour,
+            "jour_semaine"               : t_debut.dayofweek,
+            "ratio_buffered"             : ratio_buffered,
+            "ratio_rejected"             : ratio_rejected,
+            "ratio_undeliverable"        : ratio_undeliverable,
+            "is_utf16"                   : int(data["encoding"] == "UTF16"),
+            "cost"                       : round(np.mean(data["cost_list"]), 2),
+            # Pour Cox : durée en minutes + est-ce que le dernier SMS a été livré
+            "duration_cox"               : max(duree, 0.1),
+            "event"                      : 1 if dernier_est_succes else 0,
+        })
+
+    df = pd.DataFrame(lignes)
+    print(f"  Contacts traités : {len(df)}")
+    print(f"  Features créées  : {len(lignes[0]) - 1} colonnes")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════
+# ÉTAPE 5a — COX TRAINING
+# Cox calcule : dans combien de jours ce numéro sera injoignable ?
+# ══════════════════════════════════════════════════════════════
+def training_cox(df):
+    print("\n[ÉTAPE 5a] Cox Training — Survival Analysis")
+    print("  → Calcul de p_na_7j et p_na_30j pour chaque contact")
+
+    # Colonnes utilisées par Cox
+    COX_COLS = [
+        "duration_cox", "event",
+        "total_sms_envoyes", "delivery_rate", "failure_rate",
+        "echecs_consecutifs", "jours_depuis_dernier_succes",
+        "recency_score", "time_decay_score",
+        "heure_envoi", "is_utf16", "cost",
+    ]
+
+    df_cox = df[COX_COLS + ["msisdn"]].dropna()
+    df_cox = df_cox[df_cox["duration_cox"] > 0].copy()
+
+    # Vérifier qu'on a des données suffisantes
+    if len(df_cox) < 10 or df_cox["event"].nunique() < 2:
+        print("  ⚠️  Pas assez de données → valeurs par défaut")
+        df["p_na_7j"]  = 50.0
+        df["p_na_30j"] = 50.0
+        return df, None, 0.5
+
+    # Entraîner Cox
+    cph = CoxPHFitter(penalizer=0.1)
+    cph.fit(df_cox[COX_COLS], duration_col="duration_cox", event_col="event")
+
+    # Calculer la probabilité d'être NA dans 7 jours
+    # (7 jours = 7 × 24 × 60 = 10080 minutes)
+    survie_7j  = cph.predict_survival_function(df_cox[COX_COLS], times=[10080]).T
+    survie_30j = cph.predict_survival_function(df_cox[COX_COLS], times=[43200]).T
+
+    df_cox = df_cox.copy()
+    df_cox["p_na_7j"]  = ((1 - survie_7j.values.flatten())  * 100).round(1)
+    df_cox["p_na_30j"] = ((1 - survie_30j.values.flatten()) * 100).round(1)
+
+    # Calcul du C-index (mesure la qualité du modèle Cox)
+    c_index = concordance_index(
+        df_cox["duration_cox"],
+        -cph.predict_partial_hazard(df_cox[COX_COLS]),
+        df_cox["event"]
+    )
+
+    # Ajouter les résultats Cox au DataFrame principal
+    df = df.merge(df_cox[["msisdn", "p_na_7j", "p_na_30j"]], on="msisdn", how="left")
+    df["p_na_7j"]  = df["p_na_7j"].fillna(50.0)
+    df["p_na_30j"] = df["p_na_30j"].fillna(50.0)
+
+    print(f"  ✅ Cox entraîné — C-index : {c_index:.4f}")
+    print(f"  p_na_7j  moyenne : {df['p_na_7j'].mean():.1f}%")
+    print(f"  p_na_30j moyenne : {df['p_na_30j'].mean():.1f}%")
+
+    return df, cph, c_index
+
+
+# ══════════════════════════════════════════════════════════════
+# ÉTAPE 5b — XGBOOST TRAINING
+# XGBoost apprend à classer chaque numéro en 3 catégories
+# ══════════════════════════════════════════════════════════════
+def training_xgboost(df):
+    print("\n[ÉTAPE 5b] XGBoost Training — Classification")
+    print("  → Apprentissage : Available / Suspect / NA")
+
+    # ── Créer les labels (la réponse correcte pour chaque contact)
+    # On construit la vérité terrain à partir des règles métier :
+    #
+    #   Available : dernier SMS livré + bon taux + pas d'échec récent
+    #   NA        : dernier SMS non livré OU jamais livré
+    #   Suspect   : tout le reste
+    def creer_label(row):
+        if row["dernier_est_succes"] == 0 or row["delivery_rate"] == 0:
+            return "NA"
+        if (row["dernier_est_succes"] == 1
+                and row["delivery_rate"] >= 0.5
+                and row["echecs_consecutifs"] == 0):
+            return "Available"
+        return "Suspect"
+
+    df = df.copy()
+    df["label"] = df.apply(creer_label, axis=1)
+
+    print(f"  Labels créés :")
+    for lbl, cnt in df["label"].value_counts().items():
+        pct = cnt / len(df) * 100
+        bar = "█" * int(pct / 3)
+        print(f"    {lbl:<12} : {cnt:>4} ({pct:.1f}%)  {bar}")
+
+    # Convertir les labels texte en nombres (XGBoost travaille avec des nombres)
+    le = LabelEncoder()
+    df["label_enc"] = le.fit_transform(df["label"])
+    # Résultat : Available=0, NA=1, Suspect=2 (ordre alphabétique)
+
+    # Préparer X (features) et y (labels)
+    df_propre = df[FEATURE_COLS + ["label_enc"]].dropna()
+    X = df_propre[FEATURE_COLS]  # ce qu'on donne au modèle
+    y = df_propre["label_enc"]   # ce qu'on veut qu'il prédise
+
+    # Équilibrer les classes
+    # (il y a souvent plus de "Available" que de "NA" → on compense)
+    class_counts  = np.bincount(y)
+    scale_weights = class_counts.max() / (class_counts + 1e-9)
+    sample_weight = np.array([scale_weights[c] for c in y])
+
+    # Créer et entraîner XGBoost
+    xgb = XGBClassifier(
+        n_estimators     = 200,   # nombre d'arbres
+        max_depth        = 4,     # profondeur max de chaque arbre
+        learning_rate    = 0.05,  # vitesse d'apprentissage
+        subsample        = 0.8,   # % de données utilisées par arbre
+        colsample_bytree = 0.8,   # % de features utilisées par arbre
+        eval_metric      = "mlogloss",
+        random_state     = 42,
+        n_jobs           = -1,
+    )
+    xgb.fit(X, y, sample_weight=sample_weight, verbose=False)
+
+    print(f"  ✅ XGBoost entraîné sur {len(df_propre)} contacts")
+
+    return xgb, le, df
+
+
+# ══════════════════════════════════════════════════════════════
+# ÉTAPE 6 — FUSION MODEL
+# Combiner XGBoost et Cox pour calculer le score final 0-100
+# ══════════════════════════════════════════════════════════════
+def fusion_model(df, xgb, le):
+    print("\n[ÉTAPE 6] Fusion Model")
+    print("  → XGBoost + Cox → Contact Availability Score 0-100")
+
+    X = df[FEATURE_COLS].fillna(0)
+
+    # XGBoost donne une probabilité pour chaque classe
+    probas   = xgb.predict_proba(X)
+    classes  = list(le.classes_)
+    idx_av   = classes.index("Available")
+
+    # Score XGBoost = probabilité d'être Available × 100
+    score_xgb = probas[:, idx_av] * 100
+
+    # Correction Cox :
+    # Si Cox dit "ce contact a 80% de risque d'être NA dans 7 jours"
+    # on réduit son score XGBoost de 24%
+    penalite_cox = 0.3 * (df["p_na_7j"].values / 100.0)
+    score_final  = score_xgb * (1 - penalite_cox)
+    score_final  = np.clip(score_final, 0, 100).round(1)
+
+    df = df.copy()
+    df["score"] = score_final
+
+    # Classification finale selon le score
+    def classifier(score):
+        if score >= 70: return "Available"   # Risque faible  → Inclure
+        if score >= 40: return "Suspect"     # Risque moyen   → Monitoring
+        return "NA"                          # Risque élevé   → Exclure
+
+    df["classification"] = df["score"].apply(classifier)
+
+    print(f"  Score moyen : {score_final.mean():.1f} / 100")
+    print(f"  Résultats :")
+    for cls, cnt in df["classification"].value_counts().items():
+        pct = cnt / len(df) * 100
+        bar = "█" * int(pct / 3)
+        print(f"    {cls:<12} : {cnt:>4} ({pct:.1f}%)  {bar}")
+
+    return df
+
+
+# ══════════════════════════════════════════════════════════════
+# ÉTAPE 7 — EVALUATION
+# Mesurer la qualité du modèle avec 3 métriques
+# ══════════════════════════════════════════════════════════════
+def evaluation(df, xgb, le, c_index):
+    print("\n[ÉTAPE 7] Evaluation du modèle")
+
+    X      = df[FEATURE_COLS].fillna(0)
+    y_reel = df["label_enc"].dropna().astype(int)
+    y_pred = xgb.predict(X)
+    probas = xgb.predict_proba(X)
+
+    # E1 — Accuracy / Precision / Recall
+    acc  = accuracy_score(y_reel, y_pred)
+    prec = precision_score(y_reel, y_pred, average="weighted", zero_division=0)
+    rec  = recall_score(y_reel, y_pred, average="weighted", zero_division=0)
+    f1   = f1_score(y_reel, y_pred, average="weighted", zero_division=0)
+
+    print(f"\n  E1 — Accuracy / Precision / Recall")
+    print(f"    Accuracy   : {acc:.4f}   (% de contacts bien classés)")
+    print(f"    Precision  : {prec:.4f}  (quand il dit Available, a-t-il raison ?)")
+    print(f"    Recall     : {rec:.4f}   (trouve-t-il tous les Available ?)")
+    print(f"    F1-score   : {f1:.4f}")
+    print(f"\n  Rapport détaillé :")
+    print(classification_report(y_reel, y_pred, target_names=le.classes_, zero_division=0))
+
+    # E2 — AUC ROC
+    try:
+        auc = roc_auc_score(
+            pd.get_dummies(y_reel).values, probas,
+            multi_class="ovr", average="weighted"
+        )
+        print(f"  E2 — AUC ROC : {auc:.4f}  (1.0 = parfait, 0.5 = hasard)")
+    except:
+        auc = 0.0
+        print(f"  E2 — AUC ROC : N/A")
+
+    # E3 — C-index Cox
+    print(f"\n  E3 — C-index Survival (Cox) : {c_index:.4f}")
+    print(f"    > 0.7 = bon  |  0.6-0.7 = acceptable  |  < 0.6 = faible")
+
+    return {"accuracy": round(acc,4), "precision": round(prec,4),
+            "recall": round(rec,4), "f1": round(f1,4),
+            "auc_roc": round(auc,4), "c_index": round(c_index,4)}
+
+
+# ══════════════════════════════════════════════════════════════
+# ÉTAPE 8 — SAUVEGARDE model.pkl
+# Sauvegarder tout ce dont on a besoin pour la phase Prediction
+# ══════════════════════════════════════════════════════════════
+def sauvegarder(xgb, le, cph, metriques):
+    print("\n[ÉTAPE 8] Sauvegarde model.pkl")
+
+    contenu = {
+        "xgb_model"    : xgb,          # le modèle XGBoost entraîné
+        "label_encoder": le,           # pour convertir 0/1/2 → Available/NA/Suspect
+        "cox_model"    : cph,          # le modèle Cox entraîné
+        "feature_cols" : FEATURE_COLS, # liste des features dans le bon ordre
+        "metriques"    : metriques,    # accuracy, auc, c-index
+        "trained_at"   : datetime.now().isoformat(),
+    }
+
+    with open(MODEL_PATH, "wb") as f:
+        pickle.dump(contenu, f)
+
+    print(f"  ✅ Sauvegardé → {MODEL_PATH}")
+    print(f"  Taille : {os.path.getsize(MODEL_PATH) / 1024:.1f} KB")
+
+
+# ══════════════════════════════════════════════════════════════
+# PIPELINE PRINCIPAL
+# Exécute toutes les étapes dans l'ordre
+# ══════════════════════════════════════════════════════════════
+def run():
+    print("=" * 50)
+    print("  PHASE TRAINING — DÉMARRAGE")
+    print("=" * 50)
+
+    records      = data_extraction()          # Étape 1
+    contacts     = data_cleaning(records)     # Étape 2
+    contacts_n   = normalisation_statuts(contacts)  # Étape 3
+    df           = feature_engineering(contacts_n)  # Étape 4
+    df, cph, ci  = training_cox(df)           # Étape 5a
+    xgb, le, df  = training_xgboost(df)       # Étape 5b
+    df           = fusion_model(df, xgb, le)  # Étape 6
+    metriques    = evaluation(df, xgb, le, ci)# Étape 7
+    sauvegarder(xgb, le, cph, metriques)      # Étape 8
+
+    print("\n" + "=" * 50)
+    print("  PHASE TRAINING — TERMINÉE ✅")
+    print(f"  Accuracy : {metriques['accuracy']}")
+    print(f"  AUC ROC  : {metriques['auc_roc']}")
+    print(f"  C-index  : {metriques['c_index']}")
+    print("=" * 50)
+
+
+if __name__ == "__main__":
+    run()2026-03-13 01:07:18  INFO      Scheduler arrêté.
+2026-03-16 15:55:44  INFO      Exécution immédiate au démarrage...
+2026-03-16 15:55:44  INFO      ================================================================
+2026-03-16 15:55:44  INFO        DÉBUT DU TRAINING — Contact Availability Model
+2026-03-16 15:55:44  INFO      ================================================================
+2026-03-16 15:55:44  INFO      BLOC 1 — Chargement des données
+2026-03-16 15:55:44  INFO      Mode DEV → lecture depuis JSON
+2026-03-16 15:55:44  INFO      JSON → 138 documents chargés
+2026-03-16 15:55:44  INFO      Nettoyage → 107 MSISDNs uniques  (2 ignorés)
+2026-03-16 15:55:44  INFO      BLOC 2 — Feature Engineering
+2026-03-16 15:55:44  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspect': 7, 'NA': 5}
+2026-03-16 15:55:44  INFO      BLOC 3 — Génération de données synthétiques
+2026-03-16 15:55:44  INFO      Synthétique → 400 Available | 200 Suspect | 200 NA
+2026-03-16 15:55:44  INFO      BLOC 4 — Fusion real + synthetic
+2026-03-16 15:55:44  INFO      Dataset fusionné → 907 lignes  (real=107 | synth=800)  labels={'Available': 495, 'Suspect': 207, 'NA': 205}
+2026-03-16 15:55:44  INFO      BLOC 5 — Training XGBoost
+2026-03-16 15:55:45  INFO      XGBoost entraîné — top features :
+2026-03-16 15:55:45  INFO          na_rate                         0.2816
+2026-03-16 15:55:45  INFO          failure_rate                    0.1813
+2026-03-16 15:55:45  INFO          has_na_history                  0.1802
+2026-03-16 15:55:45  INFO          max_consec_fails                0.1624
+2026-03-16 15:55:45  INFO          recency_score                   0.1009
+2026-03-16 15:55:45  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-16 15:55:45  WARNING   scikit-survival absent → RSF heuristique activé
+2026-03-16 15:55:45  INFO      BLOC 7 — Calcul des scores (contacts réels)
+2026-03-16 15:55:45  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-16 15:55:45  INFO      Distribution : {'Available': 102, 'NA': 5}
+2026-03-16 15:55:45  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-16 15:55:45  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (376 KB)
+2026-03-16 15:55:45  INFO      XGBoost JSON      → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\xgboost_model.json
+2026-03-16 15:55:45  INFO      TRAINING TERMINÉ ✓  (0.3s)
+2026-03-16 15:55:45  INFO      ================================================================
+2026-03-16 22:50:12  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 22:50:12  INFO        PREDICT API — DÉMARRAGE
+2026-03-16 22:50:12  INFO        GET  http://localhost:5000/api/health
+2026-03-16 22:50:12  INFO        GET  http://localhost:5000/api/campagnes
+2026-03-16 22:50:12  INFO        POST http://localhost:5000/api/predict
+2026-03-16 22:50:12  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 22:50:12  INFO      Chargement → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-16 22:50:13  INFO        ✅ model.pkl chargé — entraîné le 2026-03-16T15:55:45.205736
+2026-03-16 22:50:13  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.37.114:5000
+2026-03-16 22:50:13  INFO      [33mPress CTRL+C to quit[0m
+2026-03-16 22:50:47  INFO      127.0.0.1 - - [16/Mar/2026 22:50:47] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-16 22:50:47  INFO      127.0.0.1 - - [16/Mar/2026 22:50:47] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-16 22:50:54  INFO      192.168.37.114 - - [16/Mar/2026 22:50:54] "[33mGET / HTTP/1.1[0m" 404 -
+2026-03-16 22:50:54  INFO      192.168.37.114 - - [16/Mar/2026 22:50:54] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-16 22:51:02  INFO      127.0.0.1 - - [16/Mar/2026 22:51:02] "GET /api/health HTTP/1.1" 200 -
+2026-03-16 22:51:02  INFO      127.0.0.1 - - [16/Mar/2026 22:51:02] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-03-16 22:51:12  ERROR     ERREUR /api/campagnes : [Errno 2] No such file or directory: 'C:\\Users\\nour2\\Downloads\\PythonProject\\PFE\\campagne_progress.json'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict-api.py", line 209, in get_campagnes
+    all_prog  = lire_json(CONFIG['JSON_PROGRESS'])
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict-api.py", line 98, in lire_json
+    with open(path, encoding='utf-8') as f:
+         ~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\nour2\\Downloads\\PythonProject\\PFE\\campagne_progress.json'
+2026-03-16 22:51:12  INFO      127.0.0.1 - - [16/Mar/2026 22:51:12] "[35m[1mGET /api/campagnes HTTP/1.1[0m" 500 -
+2026-03-16 22:51:18  INFO      127.0.0.1 - - [16/Mar/2026 22:51:18] "[31m[1mGET /api/predict HTTP/1.1[0m" 405 -
+2026-03-16 22:51:57  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 22:51:57  INFO        PREDICT API — DÉMARRAGE
+2026-03-16 22:51:57  INFO        GET  http://localhost:5000/api/health
+2026-03-16 22:51:57  INFO        GET  http://localhost:5000/api/campagnes
+2026-03-16 22:51:57  INFO        POST http://localhost:5000/api/predict
+2026-03-16 22:51:57  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 22:51:57  INFO      Chargement → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-16 22:51:57  INFO        ✅ model.pkl chargé — entraîné le 2026-03-16T15:55:45.205736
+2026-03-16 22:51:57  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.37.114:5000
+2026-03-16 22:51:57  INFO      [33mPress CTRL+C to quit[0m
+2026-03-16 22:52:51  INFO      127.0.0.1 - - [16/Mar/2026 22:52:51] "GET /api/health HTTP/1.1" 200 -
+2026-03-16 22:52:59  INFO      127.0.0.1 - - [16/Mar/2026 22:52:59] "[31m[1mGET /api/predict HTTP/1.1[0m" 405 -
+2026-03-16 23:18:07  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 23:18:07  INFO        PREDICT API — DÉMARRAGE
+2026-03-16 23:18:07  INFO        GET  http://localhost:5000/          ← Interface de test
+2026-03-16 23:18:07  INFO        GET  http://localhost:5000/api/health
+2026-03-16 23:18:07  INFO        GET  http://localhost:5000/api/campagnes
+2026-03-16 23:18:07  INFO        POST http://localhost:5000/api/predict
+2026-03-16 23:18:07  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 23:18:07  INFO      Chargement → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-16 23:18:07  INFO        ✅ model.pkl chargé — entraîné le 2026-03-16T15:55:45.205736
+2026-03-16 23:18:07  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.37.114:5000
+2026-03-16 23:18:07  INFO      [33mPress CTRL+C to quit[0m
+2026-03-16 23:19:44  INFO      127.0.0.1 - - [16/Mar/2026 23:19:44] "GET / HTTP/1.1" 200 -
+2026-03-16 23:20:01  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:20:01  INFO      POST /api/predict — campagne_id=None | decision=None
+2026-03-16 23:20:01  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:20:01  INFO        MongoDB user_contact → 138 documents
+2026-03-16 23:20:01  INFO        → Feature Engineering...
+2026-03-16 23:20:01  INFO      Nettoyage → 107 MSISDNs uniques  (2 ignorés)
+2026-03-16 23:20:01  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspect': 7, 'NA': 5}
+2026-03-16 23:20:01  INFO        → Prediction modèle ML...
+2026-03-16 23:20:01  INFO        → Fusion → Score 0-100...
+2026-03-16 23:20:01  INFO        ✅ Available     : 102
+2026-03-16 23:20:01  INFO        ⚠️  Suspected    : 0
+2026-03-16 23:20:01  INFO        ❌ Not Available : 5
+2026-03-16 23:20:01  INFO      127.0.0.1 - - [16/Mar/2026 23:20:01] "POST /api/predict HTTP/1.1" 200 -
+2026-03-16 23:20:36  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:20:36  INFO      POST /api/predict — campagne_id=None | decision=exclure_suspected
+2026-03-16 23:20:36  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:20:36  INFO        MongoDB user_contact → 138 documents
+2026-03-16 23:20:36  INFO        → Feature Engineering...
+2026-03-16 23:20:36  INFO      Nettoyage → 107 MSISDNs uniques  (2 ignorés)
+2026-03-16 23:20:36  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspect': 7, 'NA': 5}
+2026-03-16 23:20:36  INFO        → Prediction modèle ML...
+2026-03-16 23:20:36  INFO        → Fusion → Score 0-100...
+2026-03-16 23:20:36  INFO        ✅ Available     : 102
+2026-03-16 23:20:36  INFO        ⚠️  Suspected    : 0
+2026-03-16 23:20:36  INFO        ❌ Not Available : 5
+2026-03-16 23:20:36  INFO      127.0.0.1 - - [16/Mar/2026 23:20:36] "POST /api/predict HTTP/1.1" 200 -
+2026-03-16 23:20:45  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:20:45  INFO      POST /api/predict — campagne_id=None | decision=exclure_na
+2026-03-16 23:20:45  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:20:45  INFO        MongoDB user_contact → 138 documents
+2026-03-16 23:20:45  INFO        → Feature Engineering...
+2026-03-16 23:20:45  INFO      Nettoyage → 107 MSISDNs uniques  (2 ignorés)
+2026-03-16 23:20:45  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspect': 7, 'NA': 5}
+2026-03-16 23:20:45  INFO        → Prediction modèle ML...
+2026-03-16 23:20:45  INFO        → Fusion → Score 0-100...
+2026-03-16 23:20:45  INFO        ✅ Available     : 102
+2026-03-16 23:20:45  INFO        ⚠️  Suspected    : 0
+2026-03-16 23:20:45  INFO        ❌ Not Available : 5
+2026-03-16 23:20:45  INFO      127.0.0.1 - - [16/Mar/2026 23:20:45] "POST /api/predict HTTP/1.1" 200 -
+2026-03-16 23:20:50  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:20:50  INFO      POST /api/predict — campagne_id=None | decision=exclure_na
+2026-03-16 23:20:50  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:20:50  INFO        MongoDB user_contact → 138 documents
+2026-03-16 23:20:50  INFO        → Feature Engineering...
+2026-03-16 23:20:50  INFO      Nettoyage → 107 MSISDNs uniques  (2 ignorés)
+2026-03-16 23:20:50  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspect': 7, 'NA': 5}
+2026-03-16 23:20:50  INFO        → Prediction modèle ML...
+2026-03-16 23:20:50  INFO        → Fusion → Score 0-100...
+2026-03-16 23:20:50  INFO        ✅ Available     : 102
+2026-03-16 23:20:50  INFO        ⚠️  Suspected    : 0
+2026-03-16 23:20:50  INFO        ❌ Not Available : 5
+2026-03-16 23:20:50  INFO      127.0.0.1 - - [16/Mar/2026 23:20:50] "POST /api/predict HTTP/1.1" 200 -
+2026-03-16 23:20:54  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:20:54  INFO      POST /api/predict — campagne_id=None | decision=envoyer_tous
+2026-03-16 23:20:54  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:20:54  INFO        MongoDB user_contact → 138 documents
+2026-03-16 23:20:54  INFO        → Feature Engineering...
+2026-03-16 23:20:54  INFO      Nettoyage → 107 MSISDNs uniques  (2 ignorés)
+2026-03-16 23:20:54  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspect': 7, 'NA': 5}
+2026-03-16 23:20:54  INFO        → Prediction modèle ML...
+2026-03-16 23:20:54  INFO        → Fusion → Score 0-100...
+2026-03-16 23:20:54  INFO        ✅ Available     : 102
+2026-03-16 23:20:54  INFO        ⚠️  Suspected    : 0
+2026-03-16 23:20:54  INFO        ❌ Not Available : 5
+2026-03-16 23:20:54  INFO      127.0.0.1 - - [16/Mar/2026 23:20:54] "POST /api/predict HTTP/1.1" 200 -
+2026-03-16 23:21:35  INFO      127.0.0.1 - - [16/Mar/2026 23:21:35] "GET /api/health HTTP/1.1" 200 -
+2026-03-16 23:21:48  ERROR     ERREUR /api/campagnes : [Errno 2] No such file or directory: 'C:\\Users\\nour2\\Downloads\\PythonProject\\PFE\\campagne_progress.json'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict-api.py", line 209, in get_campagnes
+    all_prog  = lire_json(CONFIG['JSON_PROGRESS'])
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\predict-api.py", line 98, in lire_json
+    with open(path, encoding='utf-8') as f:
+         ~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\nour2\\Downloads\\PythonProject\\PFE\\campagne_progress.json'
+2026-03-16 23:21:48  INFO      127.0.0.1 - - [16/Mar/2026 23:21:48] "[35m[1mGET /api/campagnes HTTP/1.1[0m" 500 -
+2026-03-16 23:21:57  INFO      127.0.0.1 - - [16/Mar/2026 23:21:57] "[31m[1mGET /api/predict HTTP/1.1[0m" 405 -
+2026-03-16 23:22:40  INFO      127.0.0.1 - - [16/Mar/2026 23:22:40] "GET / HTTP/1.1" 200 -
+2026-03-16 23:22:45  INFO      192.168.37.114 - - [16/Mar/2026 23:22:45] "GET / HTTP/1.1" 200 -
+2026-03-16 23:24:59  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:24:59  INFO      POST /api/predict — campagne_id=None | decision=None
+2026-03-16 23:24:59  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:24:59  INFO        MongoDB user_contact → 138 documents
+2026-03-16 23:24:59  INFO        → Feature Engineering...
+2026-03-16 23:24:59  INFO      Nettoyage → 107 MSISDNs uniques  (2 ignorés)
+2026-03-16 23:24:59  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspect': 7, 'NA': 5}
+2026-03-16 23:24:59  INFO        → Prediction modèle ML...
+2026-03-16 23:24:59  INFO        → Fusion → Score 0-100...
+2026-03-16 23:24:59  INFO        ✅ Available     : 102
+2026-03-16 23:24:59  INFO        ⚠️  Suspected    : 0
+2026-03-16 23:24:59  INFO        ❌ Not Available : 5
+2026-03-16 23:24:59  INFO      192.168.37.114 - - [16/Mar/2026 23:24:59] "POST /api/predict HTTP/1.1" 200 -
+2026-03-16 23:29:18  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 23:29:18  INFO        PREDICT API — DÉMARRAGE
+2026-03-16 23:29:18  INFO        GET  http://localhost:5000/          ← Interface de test
+2026-03-16 23:29:18  INFO        GET  http://localhost:5000/api/health
+2026-03-16 23:29:18  INFO        GET  http://localhost:5000/api/campagnes
+2026-03-16 23:29:18  INFO        POST http://localhost:5000/api/predict
+2026-03-16 23:29:18  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 23:29:18  INFO      Chargement → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-16 23:29:18  INFO        ✅ model.pkl chargé — entraîné le 2026-03-16T15:55:45.205736
+2026-03-16 23:29:18  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.37.114:5000
+2026-03-16 23:29:18  INFO      [33mPress CTRL+C to quit[0m
+2026-03-16 23:29:22  INFO      127.0.0.1 - - [16/Mar/2026 23:29:22] "GET / HTTP/1.1" 200 -
+2026-03-16 23:29:26  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:29:26  INFO      POST /api/predict — campagne_id=None | decision=None
+2026-03-16 23:29:26  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:29:27  INFO        MongoDB user_contact → 138 documents
+2026-03-16 23:29:27  INFO        → Feature Engineering...
+2026-03-16 23:29:27  INFO      Nettoyage → 107 MSISDNs uniques  (2 ignorés)
+2026-03-16 23:29:27  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspect': 7, 'NA': 5}
+2026-03-16 23:29:27  INFO        → Prediction modèle ML...
+2026-03-16 23:29:27  INFO        → Fusion → Score 0-100...
+2026-03-16 23:29:27  INFO        ✅ Available     : 102
+2026-03-16 23:29:27  INFO        ⚠️  Suspected    : 0
+2026-03-16 23:29:27  INFO        ❌ Not Available : 5
+2026-03-16 23:29:27  INFO      127.0.0.1 - - [16/Mar/2026 23:29:27] "POST /api/predict HTTP/1.1" 200 -
+2026-03-16 23:36:30  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 23:36:30  INFO        PREDICT API — DÉMARRAGE
+2026-03-16 23:36:30  INFO        GET  http://localhost:5000/          ← Interface de test
+2026-03-16 23:36:30  INFO        GET  http://localhost:5000/api/health
+2026-03-16 23:36:30  INFO        GET  http://localhost:5000/api/campagnes
+2026-03-16 23:36:30  INFO        POST http://localhost:5000/api/predict
+2026-03-16 23:36:30  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 23:36:30  INFO      Chargement → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-16 23:36:30  INFO        ✅ model.pkl chargé — entraîné le 2026-03-16T15:55:45.205736
+2026-03-16 23:36:30  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.37.114:5000
+2026-03-16 23:36:30  INFO      [33mPress CTRL+C to quit[0m
+2026-03-16 23:36:36  INFO      127.0.0.1 - - [16/Mar/2026 23:36:36] "GET / HTTP/1.1" 200 -
+2026-03-16 23:43:40  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 23:43:40  INFO        PREDICT API — DÉMARRAGE
+2026-03-16 23:43:40  INFO        GET  http://localhost:5000/          ← Interface de test
+2026-03-16 23:43:40  INFO        GET  http://localhost:5000/api/health
+2026-03-16 23:43:40  INFO        GET  http://localhost:5000/api/campagnes
+2026-03-16 23:43:40  INFO        POST http://localhost:5000/api/predict
+2026-03-16 23:43:40  INFO      ═══════════════════════════════════════════════════════
+2026-03-16 23:43:40  INFO      Chargement → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-16 23:43:40  INFO        ✅ model.pkl chargé — entraîné le 2026-03-16T15:55:45.205736
+2026-03-16 23:43:40  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.37.114:5000
+2026-03-16 23:43:40  INFO      [33mPress CTRL+C to quit[0m
+2026-03-16 23:44:10  INFO      127.0.0.1 - - [16/Mar/2026 23:44:10] "GET / HTTP/1.1" 200 -
+2026-03-16 23:44:45  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:44:45  INFO      POST /api/predict — campagne_id=15 | decision=envoyer_tous
+2026-03-16 23:44:46  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:44:46  INFO        MongoDB user_contact → 0 documents
+2026-03-16 23:44:46  INFO      127.0.0.1 - - [16/Mar/2026 23:44:46] "[33mPOST /api/predict HTTP/1.1[0m" 404 -
+2026-03-16 23:44:52  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:44:52  INFO      POST /api/predict — campagne_id=1 | decision=envoyer_tous
+2026-03-16 23:44:52  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:44:52  INFO        MongoDB user_contact → 129 documents
+2026-03-16 23:44:52  INFO        → Feature Engineering...
+2026-03-16 23:44:52  INFO      Nettoyage → 107 MSISDNs uniques  (2 ignorés)
+2026-03-16 23:44:52  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspect': 7, 'NA': 5}
+2026-03-16 23:44:52  INFO        → Prediction modèle ML...
+2026-03-16 23:44:52  INFO        → Fusion → Score 0-100...
+2026-03-16 23:44:52  INFO        ✅ Available     : 102
+2026-03-16 23:44:52  INFO        ⚠️  Suspected    : 0
+2026-03-16 23:44:52  INFO        ❌ Not Available : 5
+2026-03-16 23:44:52  INFO      127.0.0.1 - - [16/Mar/2026 23:44:52] "POST /api/predict HTTP/1.1" 200 -
+2026-03-16 23:44:58  INFO      ──────────────────────────────────────────────────
+2026-03-16 23:44:58  INFO      POST /api/predict — campagne_id=2 | decision=envoyer_tous
+2026-03-16 23:44:58  INFO        → Lecture contacts MongoDB...
+2026-03-16 23:44:58  INFO        MongoDB user_contact → 0 documents
+2026-03-16 23:44:58  INFO      127.0.0.1 - - [16/Mar/2026 23:44:58] "[33mPOST /api/predict HTTP/1.1[0m" 404 -
+2026-03-17 01:45:43  INFO      ================================================================
+2026-03-17 01:45:43  INFO        DÉBUT DU TRAINING — Contact Availability Model
+2026-03-17 01:45:43  INFO      ================================================================
+2026-03-17 01:45:43  INFO      Nettoyage → 107 MSISDNs uniques (2 sessions ignorées)
+2026-03-17 01:45:43  INFO      BLOC 3 — Séparation Train/Test (80/20)
+2026-03-17 01:45:43  INFO      BLOC 4 — Génération de données synthétiques (Équilibrage)
+2026-03-17 01:45:43  INFO      BLOC 5 — Training XGBoost
+2026-03-17 01:45:43  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-17 01:45:43  WARNING   scikit-survival absent → RSF heuristique activé
+2026-03-17 01:45:43  INFO      BLOC 7 — Évaluation sur le Test Set (Données réelles)
+2026-03-17 01:45:43  INFO      📊 --- RÉSULTATS DE L'ÉVALUATION (Sur Test Set Réel) ---
+2026-03-17 01:45:43  INFO          Accuracy  : 0.9545
+2026-03-17 01:45:43  INFO          Precision : 0.9113
+2026-03-17 01:45:43  INFO          Recall    : 0.9545
+2026-03-17 01:45:43  INFO          F1-Score  : 0.9324
+2026-03-17 01:45:43  INFO      BLOC 8 — Sauvegarde du modèle (.pkl & .json)
+2026-03-17 01:45:43  INFO      TRAINING TERMINÉ ✓  (0.2s)
+2026-03-17 01:45:43  INFO      ================================================================
+2026-03-17 01:45:43  INFO      Scheduler actif — training planifié à 02:00
+2026-03-17 01:46:38  INFO      ================================================================
+2026-03-17 01:46:38  INFO        DÉBUT DU TRAINING — Contact Availability Model
+2026-03-17 01:46:38  INFO      ================================================================
+2026-03-17 01:46:38  INFO      Nettoyage → 107 MSISDNs uniques (2 sessions ignorées)
+2026-03-17 01:46:38  INFO      BLOC 3 — Séparation Train/Test (80/20)
+2026-03-17 01:46:38  INFO      BLOC 4 — Génération de données synthétiques (Équilibrage)
+2026-03-17 01:46:38  INFO      BLOC 5 — Training XGBoost
+2026-03-17 01:46:38  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-17 01:46:38  WARNING   scikit-survival absent → RSF heuristique activé
+2026-03-17 01:46:38  INFO      BLOC 7 — Évaluation sur le Test Set (Données réelles)
+2026-03-17 01:46:38  INFO      📊 --- RÉSULTATS DE L'ÉVALUATION (Sur Test Set Réel) ---
+2026-03-17 01:46:38  INFO          Accuracy  : 0.9545
+2026-03-17 01:46:38  INFO          Precision : 0.9113
+2026-03-17 01:46:38  INFO          Recall    : 0.9545
+2026-03-17 01:46:38  INFO          F1-Score  : 0.9324
+2026-03-17 01:46:38  INFO      BLOC 8 — Sauvegarde du modèle (.pkl & .json)
+2026-03-17 01:46:38  INFO      TRAINING TERMINÉ ✓  (0.2s)
+2026-03-17 01:46:38  INFO      ================================================================
+2026-03-17 01:46:38  INFO      Scheduler actif — training planifié à 02:00
+2026-03-17 01:47:23  INFO      ================================================================
+2026-03-17 01:47:23  INFO        DÉBUT DU TRAINING — Contact Availability Model
+2026-03-17 01:47:23  INFO      ================================================================
+2026-03-17 01:47:23  INFO      Nettoyage → 107 MSISDNs uniques (2 sessions ignorées)
+2026-03-17 01:47:23  INFO      BLOC 3 — Séparation Train/Test (80/20)
+2026-03-17 01:47:23  INFO      BLOC 4 — Génération de données synthétiques (Équilibrage)
+2026-03-17 01:47:23  INFO      BLOC 5 — Training XGBoost
+2026-03-17 01:47:23  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-17 01:47:23  WARNING   scikit-survival absent → RSF heuristique activé
+2026-03-17 01:47:23  INFO      BLOC 7 — Évaluation sur le Test Set (Données réelles)
+2026-03-17 01:47:23  INFO      📊 --- RÉSULTATS DE L'ÉVALUATION (Sur Test Set Réel) ---
+2026-03-17 01:47:23  INFO          Accuracy  : 0.9545
+2026-03-17 01:47:23  INFO          Precision : 0.9113
+2026-03-17 01:47:23  INFO          Recall    : 0.9545
+2026-03-17 01:47:23  INFO          F1-Score  : 0.9324
+2026-03-17 01:47:23  INFO      BLOC 8 — Sauvegarde du modèle (.pkl & .json)
+2026-03-17 01:47:23  INFO      TRAINING TERMINÉ ✓  (0.2s)
+2026-03-17 01:47:23  INFO      ================================================================
+2026-03-17 01:47:23  INFO      Scheduler actif — training planifié à 02:00
+2026-03-17 01:52:18  INFO      ================================================================
+2026-03-17 01:52:18  INFO        DÉBUT DU TRAINING — Contact Availability Model
+2026-03-17 01:52:18  INFO      ================================================================
+2026-03-17 01:52:18  INFO      Nettoyage → 107 MSISDNs uniques (2 sessions ignorées)
+2026-03-17 01:52:18  INFO      BLOC 3 — Séparation Train/Test (80/20)
+2026-03-17 01:52:18  INFO      BLOC 4 — Génération de données synthétiques (Équilibrage)
+2026-03-17 01:52:18  INFO      BLOC 5 — Training XGBoost
+2026-03-17 01:52:19  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-17 01:52:19  WARNING   scikit-survival absent → RSF heuristique activé
+2026-03-17 01:52:19  INFO      BLOC 7 — Évaluation sur le Test Set (Données réelles)
+2026-03-17 01:52:19  INFO      📊 --- RÉSULTATS DE L'ÉVALUATION (Sur Test Set Réel) ---
+2026-03-17 01:52:19  INFO          Accuracy  : 0.9545
+2026-03-17 01:52:19  INFO          Precision : 0.9113
+2026-03-17 01:52:19  INFO          Recall    : 0.9545
+2026-03-17 01:52:19  INFO          F1-Score  : 0.9324
+2026-03-17 01:52:19  INFO      BLOC 8 — Sauvegarde du modèle (.pkl & .json)
+2026-03-17 01:52:19  INFO      TRAINING TERMINÉ ✓  (0.4s)
+2026-03-17 01:52:19  INFO      ================================================================
+2026-03-17 01:52:19  INFO      Scheduler actif — training planifié à 02:00
+2026-03-17 02:00:00  INFO      ================================================================
+2026-03-17 02:00:00  INFO        DÉBUT DU TRAINING — Contact Availability Model
+2026-03-17 02:00:00  INFO      ================================================================
+2026-03-17 02:00:00  INFO      Nettoyage → 107 MSISDNs uniques (2 sessions ignorées)
+2026-03-17 02:00:00  INFO      BLOC 3 — Séparation Train/Test (80/20)
+2026-03-17 02:00:00  INFO      BLOC 4 — Génération de données synthétiques (Équilibrage)
+2026-03-17 02:00:00  INFO      BLOC 5 — Training XGBoost
+2026-03-17 02:00:00  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-17 02:00:00  WARNING   scikit-survival absent → RSF heuristique activé
+2026-03-17 02:00:00  INFO      BLOC 7 — Évaluation sur le Test Set (Données réelles)
+2026-03-17 02:00:00  INFO      📊 --- RÉSULTATS DE L'ÉVALUATION (Sur Test Set Réel) ---
+2026-03-17 02:00:00  INFO          Accuracy  : 0.9545
+2026-03-17 02:00:00  INFO          Precision : 0.9113
+2026-03-17 02:00:00  INFO          Recall    : 0.9545
+2026-03-17 02:00:00  INFO          F1-Score  : 0.9324
+2026-03-17 02:00:00  INFO      BLOC 8 — Sauvegarde du modèle (.pkl & .json)
+2026-03-17 02:00:00  INFO      TRAINING TERMINÉ ✓  (0.8s)
+2026-03-17 02:00:00  INFO      ================================================================
+2026-03-17 02:18:48  INFO      ================================================================
+2026-03-17 02:18:48  INFO        DÉBUT DU TRAINING — Contact Availability Model
+2026-03-17 02:18:48  INFO      ================================================================
+2026-03-17 02:18:48  INFO      Nettoyage → 107 MSISDNs uniques (2 sessions ignorées)
+2026-03-17 02:18:48  INFO      BLOC 3 — Séparation Train/Test (80/20)
+2026-03-17 02:18:48  INFO      BLOC 4 — Génération de données synthétiques (Équilibrage)
+2026-03-17 02:18:48  INFO      BLOC 5 — Training XGBoost
+2026-03-17 02:18:54  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-17 02:18:55  INFO      RSF entraîné  —  C-index (Train): 0.9796
+2026-03-17 02:18:55  INFO      BLOC 7 — Évaluation sur le Test Set (Données réelles)
+2026-03-17 02:18:55  INFO      📊 --- RÉSULTATS DE L'ÉVALUATION (Sur Test Set Réel) ---
+2026-03-17 02:18:55  INFO          Accuracy  : 0.9545
+2026-03-17 02:18:55  INFO          Precision : 0.9113
+2026-03-17 02:18:55  INFO          Recall    : 0.9545
+2026-03-17 02:18:55  INFO          F1-Score  : 0.9324
+2026-03-17 02:18:55  INFO      BLOC 8 — Sauvegarde du modèle (.pkl & .json)
+2026-03-17 02:18:55  INFO      TRAINING TERMINÉ ✓  (6.8s)
+2026-03-17 02:18:55  INFO      ================================================================
+2026-03-17 02:18:55  INFO      Scheduler actif — training planifié à 02:00
+2026-03-25 11:24:57  INFO      Exécution immédiate au démarrage...
+2026-03-25 11:24:57  INFO      ================================================================
+2026-03-25 11:24:57  INFO        DEBUT DU TRAINING — Contact Availability Model 
+2026-03-25 11:24:57  INFO      ================================================================
+2026-03-25 11:24:57  INFO      BLOC 1A — Extraction des données
+2026-03-25 11:24:57  INFO      Mode DEV → lecture depuis JSON
+2026-03-25 11:24:57  INFO      JSON → 138 documents chargés
+2026-03-25 11:24:57  INFO      BLOC 1B — Filtrage et validation des données
+2026-03-25 11:24:57  INFO      BLOC 1B — Filtrage : 136 valides  |  2 rejetés
+2026-03-25 11:24:57  INFO        Sans historique   : 2
+2026-03-25 11:24:57  INFO        MSISDN invalide   : 0
+2026-03-25 11:24:57  INFO        Date invalide     : 0
+2026-03-25 11:24:57  INFO        Statut inconnu    : 0
+2026-03-25 11:24:57  INFO        Doublons exclus   : 0
+2026-03-25 11:24:57  INFO      BLOC 1C — Normalisation des statuts DLR
+2026-03-25 11:24:57  INFO      BLOC 1C — Normalisation : 0 événements normalisés
+2026-03-25 11:24:57  INFO      BLOC 1C — Regroupement : 107 MSISDNs uniques
+2026-03-25 11:24:57  INFO      BLOC 2 — Feature Engineering
+2026-03-25 11:24:57  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspected': 7, 'NA': 5}
+2026-03-25 11:24:57  INFO      BLOC 3 — Generation de données synthétiques
+2026-03-25 11:24:57  INFO      Synthétique → 400 Available | 200 Suspected | 200 NA
+2026-03-25 11:24:57  INFO      BLOC 4 — Fusion real + synthetic
+2026-03-25 11:24:57  INFO      Dataset fusionné → 907 lignes  (real=107 | synth=800)  labels={'Available': 495, 'Suspected': 207, 'NA': 205}
+2026-03-25 11:24:57  INFO      BLOC 5 — Training XGBoost
+2026-03-25 11:24:58  INFO      XGBoost entraîné — top features :
+2026-03-25 11:24:58  INFO          recent_delivery_rate            0.2649
+2026-03-25 11:24:58  INFO          na_rate                         0.1655
+2026-03-25 11:24:58  INFO          failure_rate                    0.1430
+2026-03-25 11:24:58  INFO          has_na_history                  0.1302
+2026-03-25 11:24:58  INFO          recency_score                   0.0936
+2026-03-25 11:24:58  INFO      BLOC 5B — Evaluation du modèle (Accuracy / Precision / Recall / AUC ROC)
+2026-03-25 11:24:58  INFO      BLOC 5B — Evaluation XGBoost (test split 20%, seed=99) :
+2026-03-25 11:24:58  INFO          Accuracy          : 1.0000
+2026-03-25 11:24:58  INFO          Precision (macro) : 1.0000
+2026-03-25 11:24:58  INFO          Recall    (macro) : 1.0000
+2026-03-25 11:24:58  INFO          F1-score  (macro) : 1.0000
+2026-03-25 11:24:58  INFO          AUC ROC   (macro) : 1.0000
+2026-03-25 11:24:58  INFO          Rapport par classe :
+2026-03-25 11:24:58  INFO                          precision    recall  f1-score   support
+2026-03-25 11:24:58  INFO               Available       1.00      1.00      1.00        99
+2026-03-25 11:24:58  INFO               Suspected       1.00      1.00      1.00        42
+2026-03-25 11:24:58  INFO                      NA       1.00      1.00      1.00        41
+2026-03-25 11:24:58  INFO                accuracy                           1.00       182
+2026-03-25 11:24:58  INFO               macro avg       1.00      1.00      1.00       182
+2026-03-25 11:24:58  INFO            weighted avg       1.00      1.00      1.00       182
+2026-03-25 11:24:58  INFO      Métriques sauvegardées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-25 11:24:58  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-25 11:24:59  INFO      RSF entraîné  —  C-index (train): 0.9779
+2026-03-25 11:24:59  INFO      BLOC 7 — Calcul des scores (contacts réels)
+2026-03-25 11:24:59  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-25 11:24:59  INFO      Distribution : {'Available': 102, 'NA': 5}
+2026-03-25 11:24:59  INFO        Available    →  102  (95.3%)
+2026-03-25 11:24:59  INFO        NA           →    5  (4.7%)
+2026-03-25 11:24:59  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-25 11:24:59  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (7580 KB)
+2026-03-25 11:24:59  INFO      XGBoost JSON      → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\xgboost_model.json
+2026-03-25 11:24:59  INFO      TRAINING TERMINE  (1.8s)
+2026-03-25 11:24:59  INFO      ================================================================
+2026-03-25 11:24:59  INFO      Prochain RE-TRAINING dans 14h 35min  (intervalle=14j)
+2026-03-25 11:24:59  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-25 11:57:02  INFO      Scheduler arrêté.
+2026-03-25 11:57:06  INFO      Exécution immédiate au démarrage...
+2026-03-25 11:57:06  INFO      ================================================================
+2026-03-25 11:57:06  INFO        DEBUT DU TRAINING — Contact Availability Model 
+2026-03-25 11:57:06  INFO      ================================================================
+2026-03-25 11:57:06  INFO      BLOC 1A — Extraction des données
+2026-03-25 11:57:06  INFO      Mode DEV → lecture depuis JSON
+2026-03-25 11:57:06  INFO      JSON → 138 documents chargés
+2026-03-25 11:57:06  INFO      BLOC 1B — Filtrage et validation des données
+2026-03-25 11:57:06  INFO      BLOC 1B — Filtrage : 136 valides  |  2 rejetés
+2026-03-25 11:57:06  INFO        Sans historique   : 2
+2026-03-25 11:57:06  INFO        MSISDN invalide   : 0
+2026-03-25 11:57:06  INFO        Date invalide     : 0
+2026-03-25 11:57:06  INFO        Statut inconnu    : 0
+2026-03-25 11:57:06  INFO        Doublons exclus   : 0
+2026-03-25 11:57:06  INFO      BLOC 1C — Normalisation des statuts DLR
+2026-03-25 11:57:06  INFO      BLOC 1C — Normalisation : 0 événements normalisés
+2026-03-25 11:57:06  INFO      BLOC 1C — Regroupement : 107 MSISDNs uniques
+2026-03-25 11:57:06  INFO      BLOC 2 — Feature Engineering
+2026-03-25 11:57:06  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspected': 7, 'NA': 5}
+2026-03-25 11:57:06  INFO      BLOC 3 — Generation de données synthétiques
+2026-03-25 11:57:06  INFO      Synthétique → 400 Available | 200 Suspected | 200 NA
+2026-03-25 11:57:06  INFO      BLOC 4 — Fusion real + synthetic
+2026-03-25 11:57:06  INFO      Dataset fusionné → 907 lignes  (real=107 | synth=800)  labels={'Available': 495, 'Suspected': 207, 'NA': 205}
+2026-03-25 11:57:06  INFO      BLOC 5 — Training XGBoost
+2026-03-25 11:57:06  INFO      XGBoost entraîné — top features :
+2026-03-25 11:57:06  INFO          recent_delivery_rate            0.2649
+2026-03-25 11:57:06  INFO          na_rate                         0.1655
+2026-03-25 11:57:06  INFO          failure_rate                    0.1430
+2026-03-25 11:57:06  INFO          has_na_history                  0.1302
+2026-03-25 11:57:06  INFO          recency_score                   0.0936
+2026-03-25 11:57:06  INFO      BLOC 5B — Evaluation du modèle (Accuracy / Precision / Recall / AUC ROC)
+2026-03-25 11:57:06  INFO      BLOC 5B — Evaluation XGBoost (test split 20%, seed=99) :
+2026-03-25 11:57:06  INFO          Accuracy          : 1.0000
+2026-03-25 11:57:06  INFO          Precision (macro) : 1.0000
+2026-03-25 11:57:06  INFO          Recall    (macro) : 1.0000
+2026-03-25 11:57:06  INFO          F1-score  (macro) : 1.0000
+2026-03-25 11:57:06  INFO          AUC ROC   (macro) : 1.0000
+2026-03-25 11:57:06  INFO          Rapport par classe :
+2026-03-25 11:57:06  INFO                          precision    recall  f1-score   support
+2026-03-25 11:57:06  INFO               Available       1.00      1.00      1.00        99
+2026-03-25 11:57:06  INFO               Suspected       1.00      1.00      1.00        42
+2026-03-25 11:57:06  INFO                      NA       1.00      1.00      1.00        41
+2026-03-25 11:57:06  INFO                accuracy                           1.00       182
+2026-03-25 11:57:06  INFO               macro avg       1.00      1.00      1.00       182
+2026-03-25 11:57:06  INFO            weighted avg       1.00      1.00      1.00       182
+2026-03-25 11:57:06  INFO      Métriques sauvegardées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-25 11:57:06  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-25 11:57:07  INFO      RSF entraîné  —  C-index (train): 0.9779
+2026-03-25 11:57:07  INFO      BLOC 7 — Calcul des scores (contacts réels)
+2026-03-25 11:57:07  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-25 11:57:07  INFO      Distribution : {'Available': 102, 'NA': 5}
+2026-03-25 11:57:07  INFO        Available    →  102  (95.3%)
+2026-03-25 11:57:07  INFO        NA           →    5  (4.7%)
+2026-03-25 11:57:07  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-25 11:57:07  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (7580 KB)
+2026-03-25 11:57:07  INFO      XGBoost JSON      → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\xgboost_model.json
+2026-03-25 11:57:07  INFO      TRAINING TERMINE  (0.7s)
+2026-03-25 11:57:07  INFO      ================================================================
+2026-03-25 11:57:07  INFO      Prochain RE-TRAINING dans 14h 2min  (intervalle=14j)
+2026-03-25 11:57:07  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-28 00:23:28  INFO      Exécution immédiate au démarrage...
+2026-03-28 00:23:28  INFO      ================================================================
+2026-03-28 00:23:28  INFO        DEBUT DU TRAINING — Contact Availability Model 
+2026-03-28 00:23:28  INFO      ================================================================
+2026-03-28 00:23:28  INFO      BLOC 1A — Extraction des données
+2026-03-28 00:23:28  INFO      MongoDB → 138 documents chargés
+2026-03-28 00:23:28  INFO      BLOC 1B — Filtrage et validation des données
+2026-03-28 00:23:28  INFO      BLOC 1B — Filtrage : 136 valides  |  2 rejetés
+2026-03-28 00:23:28  INFO        Sans historique   : 2
+2026-03-28 00:23:28  INFO        MSISDN invalide   : 0
+2026-03-28 00:23:28  INFO        Date invalide     : 0
+2026-03-28 00:23:28  INFO        Statut inconnu    : 0
+2026-03-28 00:23:28  INFO        Doublons exclus   : 0
+2026-03-28 00:23:28  INFO      BLOC 1C — Normalisation des statuts DLR
+2026-03-28 00:23:28  INFO      BLOC 1C — Normalisation : 0 événements normalisés
+2026-03-28 00:23:28  INFO      BLOC 1C — Regroupement : 107 MSISDNs uniques
+2026-03-28 00:23:28  INFO      BLOC 2 — Feature Engineering
+2026-03-28 00:23:28  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspected': 7, 'NA': 5}
+2026-03-28 00:23:28  INFO      BLOC 3 — Generation de données synthétiques
+2026-03-28 00:23:28  INFO      Synthétique → 400 Available | 200 Suspected | 200 NA
+2026-03-28 00:23:28  INFO      BLOC 4 — Fusion real + synthetic
+2026-03-28 00:23:28  INFO      Dataset fusionné → 907 lignes  (real=107 | synth=800)  labels={'Available': 495, 'Suspected': 207, 'NA': 205}
+2026-03-28 00:23:28  INFO      BLOC 5 — Training XGBoost
+2026-03-28 00:23:28  INFO      XGBoost entraîné — top features :
+2026-03-28 00:23:28  INFO          recent_delivery_rate            0.2517
+2026-03-28 00:23:28  INFO          na_rate                         0.1612
+2026-03-28 00:23:28  INFO          has_na_history                  0.1536
+2026-03-28 00:23:28  INFO          failure_rate                    0.1332
+2026-03-28 00:23:28  INFO          avg_resolution_time_min         0.1029
+2026-03-28 00:23:28  INFO      BLOC 5B — Evaluation du modèle (Accuracy / Precision / Recall / AUC ROC)
+2026-03-28 00:23:28  INFO      BLOC 5B — Evaluation XGBoost (test split 20%, seed=99) :
+2026-03-28 00:23:28  INFO          Accuracy          : 1.0000
+2026-03-28 00:23:28  INFO          Precision (macro) : 1.0000
+2026-03-28 00:23:28  INFO          Recall    (macro) : 1.0000
+2026-03-28 00:23:28  INFO          F1-score  (macro) : 1.0000
+2026-03-28 00:23:28  INFO          AUC ROC   (macro) : 1.0000
+2026-03-28 00:23:28  INFO          Rapport par classe :
+2026-03-28 00:23:28  INFO                          precision    recall  f1-score   support
+2026-03-28 00:23:28  INFO               Available       1.00      1.00      1.00        99
+2026-03-28 00:23:28  INFO               Suspected       1.00      1.00      1.00        42
+2026-03-28 00:23:28  INFO                      NA       1.00      1.00      1.00        41
+2026-03-28 00:23:28  INFO                accuracy                           1.00       182
+2026-03-28 00:23:28  INFO               macro avg       1.00      1.00      1.00       182
+2026-03-28 00:23:28  INFO            weighted avg       1.00      1.00      1.00       182
+2026-03-28 00:23:28  INFO      Métriques sauvegardées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-28 00:23:28  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-28 00:23:30  INFO      RSF entraîné  —  C-index (train): 0.9785
+2026-03-28 00:23:30  INFO      BLOC 7 — Calcul des scores (contacts réels)
+2026-03-28 00:23:30  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-28 00:23:30  INFO      Distribution : {'Available': 102, 'NA': 5}
+2026-03-28 00:23:30  INFO        Available    →  102  (95.3%)
+2026-03-28 00:23:30  INFO        NA           →    5  (4.7%)
+2026-03-28 00:23:30  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-28 00:23:30  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (7603 KB)
+2026-03-28 00:23:30  INFO      XGBoost JSON      → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\xgboost_model.json
+2026-03-28 00:23:30  INFO      TRAINING TERMINE  (2.0s)
+2026-03-28 00:23:30  INFO      ================================================================
+2026-03-28 00:23:30  INFO      Prochain RE-TRAINING dans 1h 36min  (intervalle=14j)
+2026-03-28 00:23:30  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-28 00:23:54  INFO      Scheduler arrêté.
+2026-03-28 00:23:57  INFO      Exécution immédiate au démarrage...
+2026-03-28 00:23:57  INFO      ================================================================
+2026-03-28 00:23:57  INFO        DEBUT DU TRAINING — Contact Availability Model 
+2026-03-28 00:23:57  INFO      ================================================================
+2026-03-28 00:23:57  INFO      BLOC 1A — Extraction des données
+2026-03-28 00:23:57  INFO      MongoDB → 138 documents chargés
+2026-03-28 00:23:57  INFO      BLOC 1B — Filtrage et validation des données
+2026-03-28 00:23:57  INFO      BLOC 1B — Filtrage : 136 valides  |  2 rejetés
+2026-03-28 00:23:57  INFO        Sans historique   : 2
+2026-03-28 00:23:57  INFO        MSISDN invalide   : 0
+2026-03-28 00:23:57  INFO        Date invalide     : 0
+2026-03-28 00:23:57  INFO        Statut inconnu    : 0
+2026-03-28 00:23:57  INFO        Doublons exclus   : 0
+2026-03-28 00:23:57  INFO      BLOC 1C — Normalisation des statuts DLR
+2026-03-28 00:23:57  INFO      BLOC 1C — Normalisation : 0 événements normalisés
+2026-03-28 00:23:57  INFO      BLOC 1C — Regroupement : 107 MSISDNs uniques
+2026-03-28 00:23:57  INFO      BLOC 2 — Feature Engineering
+2026-03-28 00:23:57  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspected': 7, 'NA': 5}
+2026-03-28 00:23:57  INFO      BLOC 3 — Generation de données synthétiques
+2026-03-28 00:23:57  INFO      Synthétique → 400 Available | 200 Suspected | 200 NA
+2026-03-28 00:23:57  INFO      BLOC 4 — Fusion real + synthetic
+2026-03-28 00:23:57  INFO      Dataset fusionné → 907 lignes  (real=107 | synth=800)  labels={'Available': 495, 'Suspected': 207, 'NA': 205}
+2026-03-28 00:23:57  INFO      BLOC 5 — Training XGBoost
+2026-03-28 00:23:57  INFO      XGBoost entraîné — top features :
+2026-03-28 00:23:57  INFO          recent_delivery_rate            0.2517
+2026-03-28 00:23:57  INFO          na_rate                         0.1612
+2026-03-28 00:23:57  INFO          has_na_history                  0.1536
+2026-03-28 00:23:57  INFO          failure_rate                    0.1332
+2026-03-28 00:23:57  INFO          avg_resolution_time_min         0.1029
+2026-03-28 00:23:57  INFO      BLOC 5B — Evaluation du modèle (Accuracy / Precision / Recall / AUC ROC)
+2026-03-28 00:23:57  INFO      BLOC 5B — Evaluation XGBoost (test split 20%, seed=99) :
+2026-03-28 00:23:57  INFO          Accuracy          : 1.0000
+2026-03-28 00:23:57  INFO          Precision (macro) : 1.0000
+2026-03-28 00:23:57  INFO          Recall    (macro) : 1.0000
+2026-03-28 00:23:57  INFO          F1-score  (macro) : 1.0000
+2026-03-28 00:23:57  INFO          AUC ROC   (macro) : 1.0000
+2026-03-28 00:23:57  INFO          Rapport par classe :
+2026-03-28 00:23:57  INFO                          precision    recall  f1-score   support
+2026-03-28 00:23:57  INFO               Available       1.00      1.00      1.00        99
+2026-03-28 00:23:57  INFO               Suspected       1.00      1.00      1.00        42
+2026-03-28 00:23:57  INFO                      NA       1.00      1.00      1.00        41
+2026-03-28 00:23:57  INFO                accuracy                           1.00       182
+2026-03-28 00:23:57  INFO               macro avg       1.00      1.00      1.00       182
+2026-03-28 00:23:57  INFO            weighted avg       1.00      1.00      1.00       182
+2026-03-28 00:23:57  INFO      Métriques sauvegardées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-28 00:23:57  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-28 00:23:57  INFO      RSF entraîné  —  C-index (train): 0.9785
+2026-03-28 00:23:58  INFO      BLOC 7 — Calcul des scores (contacts réels)
+2026-03-28 00:23:58  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-28 00:23:58  INFO      Distribution : {'Available': 102, 'NA': 5}
+2026-03-28 00:23:58  INFO        Available    →  102  (95.3%)
+2026-03-28 00:23:58  INFO        NA           →    5  (4.7%)
+2026-03-28 00:23:58  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-28 00:23:58  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (7603 KB)
+2026-03-28 00:23:58  INFO      XGBoost JSON      → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\xgboost_model.json
+2026-03-28 00:23:58  INFO      TRAINING TERMINE  (1.2s)
+2026-03-28 00:23:58  INFO      ================================================================
+2026-03-28 00:23:58  INFO      Prochain RE-TRAINING dans 1h 36min  (intervalle=14j)
+2026-03-28 00:23:58  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-28 00:25:13  INFO      Scheduler arrêté.
+2026-03-28 13:16:17  INFO      Exécution immédiate au démarrage...
+2026-03-28 13:16:17  INFO      ================================================================
+2026-03-28 13:16:17  INFO        DEBUT DU TRAINING — Contact Availability Model 
+2026-03-28 13:16:17  INFO      ================================================================
+2026-03-28 13:16:17  INFO      BLOC 1A — Extraction des données
+2026-03-28 13:16:48  INFO      MongoDB → 138 documents chargés
+2026-03-28 13:16:48  INFO      BLOC 1B — Filtrage et validation des données
+2026-03-28 13:16:48  INFO      BLOC 1B — Filtrage : 136 valides  |  2 rejetés
+2026-03-28 13:16:48  INFO        Sans historique   : 2
+2026-03-28 13:16:48  INFO        MSISDN invalide   : 0
+2026-03-28 13:16:48  INFO        Date invalide     : 0
+2026-03-28 13:16:48  INFO        Statut inconnu    : 0
+2026-03-28 13:16:48  INFO        Doublons exclus   : 0
+2026-03-28 13:16:48  INFO      BLOC 1C — Normalisation des statuts DLR
+2026-03-28 13:16:48  INFO      BLOC 1C — Normalisation : 0 événements normalisés
+2026-03-28 13:16:48  INFO      BLOC 1C — Regroupement : 107 MSISDNs uniques
+2026-03-28 13:16:48  INFO      BLOC 2 — Feature Engineering
+2026-03-28 13:16:48  INFO      Features → 107 contacts  |  labels : {'Available': 95, 'Suspected': 7, 'NA': 5}
+2026-03-28 13:16:48  INFO      BLOC 3 — Generation de données synthétiques
+2026-03-28 13:16:49  INFO      Synthétique → 400 Available | 200 Suspected | 200 NA
+2026-03-28 13:16:49  INFO      BLOC 4 — Fusion real + synthetic
+2026-03-28 13:16:49  INFO      Dataset fusionné → 907 lignes  (real=107 | synth=800)  labels={'Available': 495, 'Suspected': 207, 'NA': 205}
+2026-03-28 13:16:49  INFO      BLOC 5 — Training XGBoost
+2026-03-28 13:16:49  INFO      XGBoost entraîné — top features :
+2026-03-28 13:16:49  INFO          recent_delivery_rate            0.2517
+2026-03-28 13:16:49  INFO          na_rate                         0.1612
+2026-03-28 13:16:49  INFO          has_na_history                  0.1536
+2026-03-28 13:16:49  INFO          failure_rate                    0.1332
+2026-03-28 13:16:49  INFO          avg_resolution_time_min         0.1029
+2026-03-28 13:16:49  INFO      BLOC 5B — Evaluation du modèle (Accuracy / Precision / Recall / AUC ROC)
+2026-03-28 13:16:49  INFO      BLOC 5B — Evaluation XGBoost (test split 20%, seed=99) :
+2026-03-28 13:16:49  INFO          Accuracy          : 1.0000
+2026-03-28 13:16:49  INFO          Precision (macro) : 1.0000
+2026-03-28 13:16:49  INFO          Recall    (macro) : 1.0000
+2026-03-28 13:16:49  INFO          F1-score  (macro) : 1.0000
+2026-03-28 13:16:49  INFO          AUC ROC   (macro) : 1.0000
+2026-03-28 13:16:49  INFO          Rapport par classe :
+2026-03-28 13:16:49  INFO                          precision    recall  f1-score   support
+2026-03-28 13:16:49  INFO               Available       1.00      1.00      1.00        99
+2026-03-28 13:16:49  INFO               Suspected       1.00      1.00      1.00        42
+2026-03-28 13:16:49  INFO                      NA       1.00      1.00      1.00        41
+2026-03-28 13:16:49  INFO                accuracy                           1.00       182
+2026-03-28 13:16:49  INFO               macro avg       1.00      1.00      1.00       182
+2026-03-28 13:16:49  INFO            weighted avg       1.00      1.00      1.00       182
+2026-03-28 13:16:49  INFO      Métriques sauvegardées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-28 13:16:49  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-28 13:16:52  INFO      RSF entraîné  —  C-index (train): 0.9785
+2026-03-28 13:16:52  INFO      BLOC 7 — Calcul des scores (contacts réels)
+2026-03-28 13:16:52  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-28 13:16:52  INFO      Distribution : {'Available': 102, 'NA': 5}
+2026-03-28 13:16:52  INFO        Available    →  102  (95.3%)
+2026-03-28 13:16:52  INFO        NA           →    5  (4.7%)
+2026-03-28 13:16:52  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-28 13:16:52  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (7604 KB)
+2026-03-28 13:16:52  INFO      XGBoost JSON      → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\xgboost_model.json
+2026-03-28 13:16:52  INFO      TRAINING TERMINE  (34.4s)
+2026-03-28 13:16:52  INFO      ================================================================
+2026-03-28 13:16:52  INFO      Prochain RE-TRAINING dans 12h 43min  (intervalle=14j)
+2026-03-28 13:16:52  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-29 11:39:29  INFO      Exécution immédiate au démarrage...
+2026-03-29 11:39:29  INFO      ================================================================
+2026-03-29 11:39:29  INFO        DEBUT DU TRAINING — Contact Availability Model v4.1.0
+2026-03-29 11:39:29  INFO      ================================================================
+2026-03-29 11:39:29  INFO      BLOC 1A — Extraction des données
+2026-03-29 11:39:29  INFO      MongoDB → 138 documents chargés
+2026-03-29 11:39:29  INFO      BLOC 1B — Filtrage et validation
+2026-03-29 11:39:29  INFO      BLOC 1B — Filtrage : 136 valides | 2 rejetés
+2026-03-29 11:39:29  INFO        Sans historique     : 2
+2026-03-29 11:39:29  INFO        MSISDN invalide     : 0
+2026-03-29 11:39:29  INFO        Date invalide       : 0
+2026-03-29 11:39:29  INFO        Statuts nettoyés (0/16/34) : 5
+2026-03-29 11:39:29  INFO        Statut inconnu      : 0
+2026-03-29 11:39:29  INFO        Doublons exclus     : 0
+2026-03-29 11:39:29  INFO      BLOC 1C — Normalisation DLR (4→2, 8→2)
+2026-03-29 11:39:29  INFO      BLOC 1C — Normalisation : 184 événements normalisés (4→2, 8→2)
+2026-03-29 11:39:29  INFO      BLOC 1C — Regroupement : 107 MSISDNs uniques
+2026-03-29 11:39:29  INFO      BLOC 2 — Feature Engineering
+2026-03-29 11:39:29  INFO      Features → 107 contacts | labels: {'Available': 66, 'Suspected': 37, 'NA': 4}
+2026-03-29 11:39:29  INFO      BLOC 3 — Génération de données synthétiques
+2026-03-29 11:39:29  INFO      Synthétique → 400 Available | 200 Suspected | 200 NA
+2026-03-29 11:39:29  INFO      BLOC 4 — Fusion réel + synthétique
+2026-03-29 11:39:29  INFO      Dataset fusionné → 907 lignes (real=107 | synth=800)
+2026-03-29 11:39:29  INFO      BLOC 5 — Training XGBoost
+2026-03-29 11:39:30  INFO      XGBoost entraîné — top features:
+2026-03-29 11:39:30  INFO          na_rate                         0.2970
+2026-03-29 11:39:30  INFO          max_consec_fails                0.2365
+2026-03-29 11:39:30  INFO          recent_delivery_rate            0.1882
+2026-03-29 11:39:30  INFO          buffered_rate                   0.0941
+2026-03-29 11:39:30  INFO          recency_score                   0.0851
+2026-03-29 11:39:30  INFO      BLOC 5B — Évaluation du modèle
+2026-03-29 11:39:30  INFO      BLOC 5B — Evaluation XGBoost:
+2026-03-29 11:39:30  INFO          Accuracy: 1.0000
+2026-03-29 11:39:30  INFO          Precision (macro): 1.0000
+2026-03-29 11:39:30  INFO          Recall (macro): 1.0000
+2026-03-29 11:39:30  INFO          F1-score (macro): 1.0000
+2026-03-29 11:39:30  INFO          AUC ROC (macro): 1.0000
+2026-03-29 11:39:30  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-29 11:39:31  INFO      RSF entraîné — C-index: 0.9751
+2026-03-29 11:39:31  INFO      BLOC 7 — Calcul des scores de disponibilité
+2026-03-29 11:39:31  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-29 11:39:31  INFO      Distribution des décisions: {'Available': 101, 'Suspected': 6}
+2026-03-29 11:39:31  INFO        Available    →  101 (94.4%)
+2026-03-29 11:39:31  INFO        Suspected    →    6 (5.6%)
+2026-03-29 11:39:31  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-29 11:39:31  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl (7785 KB)
+2026-03-29 11:39:31  INFO      TRAINING TERMINÉ (2.1s)
+2026-03-29 11:39:31  INFO      ================================================================
+2026-03-29 11:39:31  INFO      Prochain cycle dans 14h 20min
+2026-03-29 11:39:31  INFO      Scheduler actif — re-training à 02:00 toutes les 14 jours
+2026-03-29 12:33:06  INFO      Scheduler arrêté
+2026-03-29 12:33:21  INFO      Exécution immédiate au démarrage...
+2026-03-29 12:33:21  INFO      ================================================================
+2026-03-29 12:33:21  INFO        DEBUT DU TRAINING — Contact Availability Model v4.1.0
+2026-03-29 12:33:21  INFO      ================================================================
+2026-03-29 12:33:21  INFO      BLOC 1A — Extraction des données
+2026-03-29 12:33:21  INFO      MongoDB → 138 documents chargés
+2026-03-29 12:33:21  INFO      BLOC 1B — Filtrage et validation
+2026-03-29 12:33:21  INFO      BLOC 1B — Filtrage : 136 valides | 2 rejetés
+2026-03-29 12:33:21  INFO        Sans historique     : 2
+2026-03-29 12:33:21  INFO        MSISDN invalide     : 0
+2026-03-29 12:33:21  INFO        Date invalide       : 0
+2026-03-29 12:33:21  INFO        Statuts nettoyés (0/16/34) : 5
+2026-03-29 12:33:21  INFO        Statut inconnu      : 0
+2026-03-29 12:33:21  INFO        Doublons exclus     : 0
+2026-03-29 12:33:21  INFO      BLOC 1C — Normalisation DLR (4→2, 8→2)
+2026-03-29 12:33:21  INFO      BLOC 1C — Normalisation : 184 événements normalisés (4→2, 8→2)
+2026-03-29 12:33:21  INFO      BLOC 1C — Regroupement : 107 MSISDNs uniques
+2026-03-29 12:33:21  INFO      BLOC 2 — Feature Engineering
+2026-03-29 12:33:21  INFO      Features → 107 contacts | labels: {'Available': 66, 'Suspected': 37, 'NA': 4}
+2026-03-29 12:33:21  INFO      BLOC 3 — Génération de données synthétiques
+2026-03-29 12:33:21  INFO      Synthétique → 400 Available | 200 Suspected | 200 NA
+2026-03-29 12:33:21  INFO      BLOC 4 — Fusion réel + synthétique
+2026-03-29 12:33:21  INFO      Dataset fusionné → 907 lignes (real=107 | synth=800)
+2026-03-29 12:33:21  INFO      BLOC 5 — Training XGBoost
+2026-03-29 12:33:22  INFO      XGBoost entraîné — top features:
+2026-03-29 12:33:22  INFO          na_rate                         0.2648
+2026-03-29 12:33:22  INFO          max_consec_fails                0.2237
+2026-03-29 12:33:22  INFO          recent_delivery_rate            0.1749
+2026-03-29 12:33:22  INFO          buffered_rate                   0.1444
+2026-03-29 12:33:22  INFO          recency_score                   0.0756
+2026-03-29 12:33:22  INFO      BLOC 5B — Évaluation du modèle
+2026-03-29 12:33:22  INFO      BLOC 5B — Evaluation XGBoost:
+2026-03-29 12:33:22  INFO          Accuracy: 0.9945
+2026-03-29 12:33:22  INFO          Precision (macro): 0.9932
+2026-03-29 12:33:22  INFO          Recall (macro): 0.9919
+2026-03-29 12:33:22  INFO          F1-score (macro): 0.9924
+2026-03-29 12:33:22  INFO          AUC ROC (macro): 1.0000
+2026-03-29 12:33:22  INFO      BLOC 6 — Training Random Survival Forest
+2026-03-29 12:33:24  INFO      RSF entraîné — C-index: 0.9753
+2026-03-29 12:33:24  INFO      BLOC 7 — Calcul des scores de disponibilité
+2026-03-29 12:33:24  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-29 12:33:24  INFO      Distribution des décisions: {'Available': 102, 'Suspected': 5}
+2026-03-29 12:33:24  INFO        Available    →  102 (95.3%)
+2026-03-29 12:33:24  INFO        Suspected    →    5 (4.7%)
+2026-03-29 12:33:24  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-29 12:33:24  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl (7612 KB)
+2026-03-29 12:33:24  INFO      TRAINING TERMINÉ (3.6s)
+2026-03-29 12:33:24  INFO      ================================================================
+2026-03-29 12:33:24  INFO      Prochain cycle dans 13h 26min
+2026-03-29 12:33:24  INFO      Scheduler actif — re-training à 02:00 toutes les 14 jours
+2026-03-29 14:19:12  INFO      Scheduler arrêté
+2026-03-29 14:19:29  INFO      Exécution immédiate au démarrage...
+2026-03-29 14:19:29  INFO      ================================================================
+2026-03-29 14:19:29  INFO        DEBUT DU TRAINING — Contact Availability Model v5
+2026-03-29 14:19:29  INFO      ================================================================
+2026-03-29 14:19:29  INFO      BLOC 1A — Extraction des données
+2026-03-29 14:19:30  INFO      MongoDB → 0 documents chargés
+2026-03-29 14:19:30  INFO      BLOC 1B — Filtrage et validation des données
+2026-03-29 14:19:30  INFO      BLOC 1B — Filtrage : 0 valides  |  0 rejetés
+2026-03-29 14:19:30  INFO        Sans historique            : 0
+2026-03-29 14:19:30  INFO        MSISDN invalide            : 0
+2026-03-29 14:19:30  INFO        Date invalide              : 0
+2026-03-29 14:19:30  INFO        Statuts nettoyés (0/16/34) : 0
+2026-03-29 14:19:30  INFO        Statut inconnu             : 0
+2026-03-29 14:19:30  INFO        Doublons exclus            : 0
+2026-03-29 14:19:30  INFO      BLOC 1C — Normalisation des statuts DLR
+2026-03-29 14:19:30  INFO      BLOC 1C — Normalisation : 0 événements normalisés (4→2, 8→2)
+2026-03-29 14:19:30  INFO      BLOC 1C — Regroupement : 0 MSISDNs uniques
+2026-03-29 14:19:30  INFO      BLOC 2 — Feature Engineering (8 features XGBoost + 2 survival RSF)
+2026-03-29 14:19:30  ERROR     ERREUR TRAINING : 'label'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 839, in run_training
+    df_real = build_features(contacts)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 484, in build_features
+    log.info(f"Features → {len(df)} contacts  |  labels : {df['label'].value_counts().to_dict()}")
+                                                           ~~^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\frame.py", line 4113, in __getitem__
+    indexer = self.columns.get_loc(key)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\indexes\range.py", line 417, in get_loc
+    raise KeyError(key)
+KeyError: 'label'
+2026-03-29 14:19:30  INFO      Prochain RE-TRAINING dans 11h 40min  (intervalle=14j)
+2026-03-29 14:19:30  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-29 14:21:46  INFO      Scheduler arrêté.
+2026-03-29 14:21:50  INFO      Exécution immédiate au démarrage...
+2026-03-29 14:21:50  INFO      ================================================================
+2026-03-29 14:21:50  INFO        DEBUT DU TRAINING — Contact Availability Model v5
+2026-03-29 14:21:50  INFO      ================================================================
+2026-03-29 14:21:50  INFO      BLOC 1A — Extraction des données
+2026-03-29 14:21:54  INFO      MongoDB → 218225 documents chargés
+2026-03-29 14:21:54  INFO      BLOC 1B — Filtrage et validation des données
+2026-03-29 14:21:55  INFO      BLOC 1B — Filtrage : 53519 valides  |  164706 rejetés
+2026-03-29 14:21:55  INFO        Sans historique            : 117634
+2026-03-29 14:21:55  INFO        MSISDN invalide            : 0
+2026-03-29 14:21:55  INFO        Date invalide              : 0
+2026-03-29 14:21:55  INFO        Statuts nettoyés (0/16/34) : 47072
+2026-03-29 14:21:55  INFO        Statut inconnu             : 0
+2026-03-29 14:21:55  INFO        Doublons exclus            : 0
+2026-03-29 14:21:55  INFO      BLOC 1C — Normalisation des statuts DLR
+2026-03-29 14:21:55  INFO      BLOC 1C — Normalisation : 106685 événements normalisés (4→2, 8→2)
+2026-03-29 14:21:55  INFO      BLOC 1C — Regroupement : 41142 MSISDNs uniques
+2026-03-29 14:21:55  INFO      BLOC 2 — Feature Engineering (8 features XGBoost + 2 survival RSF)
+2026-03-29 14:21:56  INFO      Features → 41142 contacts  |  labels : {'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-29 14:21:56  INFO      BLOC 3/4 — Encodage des labels
+2026-03-29 14:21:56  INFO      Dataset → 41142 contacts réels  labels={'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-29 14:21:56  INFO      BLOC 5 — Training XGBoost (input : 8 features)
+2026-03-29 14:21:57  INFO      XGBoost entraîné — top features :
+2026-03-29 14:21:57  INFO          echecs_consecutifs_max          0.5290
+2026-03-29 14:21:57  INFO          total_envois                    0.1415
+2026-03-29 14:21:57  INFO          taux_livraison                  0.1215
+2026-03-29 14:21:57  INFO          score_recence                   0.0977
+2026-03-29 14:21:57  INFO          taux_echec                      0.0633
+2026-03-29 14:21:57  INFO      BLOC 5B — Evaluation du modèle
+2026-03-29 14:21:57  INFO      BLOC 5B — Evaluation XGBoost (test split 20%, seed=99) :
+2026-03-29 14:21:57  INFO          Accuracy          : 0.9926
+2026-03-29 14:21:57  INFO          Precision (macro) : 0.6642
+2026-03-29 14:21:57  INFO          Recall    (macro) : 0.6667
+2026-03-29 14:21:57  INFO          F1-score  (macro) : 0.6654
+2026-03-29 14:21:57  INFO          AUC ROC   (macro) : 0.9557
+2026-03-29 14:21:57  INFO          Rapport par classe :
+2026-03-29 14:21:57  INFO                          precision    recall  f1-score   support
+2026-03-29 14:21:57  INFO               Available       1.00      1.00      1.00        16
+2026-03-29 14:21:57  INFO               Suspected       0.99      1.00      1.00      8152
+2026-03-29 14:21:57  INFO                      NA       0.00      0.00      0.00        61
+2026-03-29 14:21:57  INFO                accuracy                           0.99      8229
+2026-03-29 14:21:57  INFO               macro avg       0.66      0.67      0.67      8229
+2026-03-29 14:21:57  INFO            weighted avg       0.99      0.99      0.99      8229
+2026-03-29 14:21:57  INFO      Métriques sauvegardées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-29 14:21:57  INFO      BLOC 6 — Training RSF (input : 8 features + evenement_na + duree_jours)
+2026-03-29 14:21:59  INFO      RSF entraîné — C-index (train) : 0.9249
+2026-03-29 14:22:00  INFO      BLOC 7 — Calcul des scores de disponibilité
+2026-03-29 14:22:01  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-29 14:22:01  INFO      Distribution finale : {'Available': 41142}
+2026-03-29 14:22:01  INFO        Available    → 41142  (100.0%)
+2026-03-29 14:22:01  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-29 14:22:01  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (823 KB)
+2026-03-29 14:22:01  INFO      XGBoost JSON      → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\xgboost_model.json
+2026-03-29 14:22:01  INFO      TRAINING TERMINE  (11.4s)
+2026-03-29 14:22:01  INFO      ================================================================
+2026-03-29 14:22:01  INFO      Prochain RE-TRAINING dans 11h 37min  (intervalle=14j)
+2026-03-29 14:22:01  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-29 18:03:28  INFO      Scheduler arrêté.
+2026-03-29 18:05:40  INFO      Exécution immédiate au démarrage...
+2026-03-29 18:05:40  INFO      ================================================================
+2026-03-29 18:05:40  INFO        DEBUT DU TRAINING — Contact Availability Model v5
+2026-03-29 18:05:40  INFO      ================================================================
+2026-03-29 18:05:40  INFO      BLOC 1A — Extraction des données
+2026-03-29 18:05:42  INFO      MongoDB → 218225 documents chargés
+2026-03-29 18:05:42  INFO      BLOC 1B — Filtrage et validation des données
+2026-03-29 18:05:43  INFO      BLOC 1B — Filtrage : 53519 valides  |  164706 rejetés
+2026-03-29 18:05:43  INFO        Sans historique            : 117634
+2026-03-29 18:05:43  INFO        MSISDN invalide            : 0
+2026-03-29 18:05:43  INFO        Date invalide              : 0
+2026-03-29 18:05:43  INFO        Statuts nettoyés (0/16/34) : 47072
+2026-03-29 18:05:43  INFO        Statut inconnu             : 0
+2026-03-29 18:05:43  INFO        Doublons exclus            : 0
+2026-03-29 18:05:43  INFO      BLOC 1C — Normalisation des statuts DLR
+2026-03-29 18:05:43  INFO      BLOC 1C — Normalisation : 106685 événements normalisés (4→2, 8→2)
+2026-03-29 18:05:43  INFO      BLOC 1C — Regroupement : 41142 MSISDNs uniques
+2026-03-29 18:05:43  INFO      BLOC 2 — Feature Engineering (8 features XGBoost + 2 survival RSF)
+2026-03-29 18:05:44  INFO      Features → 41142 contacts  |  labels : {'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-29 18:05:44  INFO      BLOC 3/4 — Encodage des labels
+2026-03-29 18:05:44  INFO      Dataset → 41142 contacts réels  labels={'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-29 18:05:44  INFO      BLOC 5 — Training XGBoost (input : 8 features)
+2026-03-29 18:05:44  INFO      XGBoost entraîné — top features :
+2026-03-29 18:05:44  INFO          echecs_consecutifs_max          0.4898
+2026-03-29 18:05:44  INFO          total_envois                    0.1391
+2026-03-29 18:05:44  INFO          taux_livraison                  0.1301
+2026-03-29 18:05:44  INFO          score_recence                   0.1198
+2026-03-29 18:05:44  INFO          taux_echec                      0.0693
+2026-03-29 18:05:44  INFO      BLOC 5B — Evaluation du modèle
+2026-03-29 18:05:44  INFO      BLOC 5B — Evaluation XGBoost (test split 20%, seed=99) :
+2026-03-29 18:05:44  INFO          Accuracy          : 0.9926
+2026-03-29 18:05:44  INFO          Precision (macro) : 0.6642
+2026-03-29 18:05:44  INFO          Recall    (macro) : 0.6667
+2026-03-29 18:05:44  INFO          F1-score  (macro) : 0.6654
+2026-03-29 18:05:44  INFO          AUC ROC   (macro) : 0.9557
+2026-03-29 18:05:44  INFO          Rapport par classe :
+2026-03-29 18:05:44  INFO                          precision    recall  f1-score   support
+2026-03-29 18:05:44  INFO               Available       1.00      1.00      1.00        16
+2026-03-29 18:05:44  INFO               Suspected       0.99      1.00      1.00      8152
+2026-03-29 18:05:44  INFO                      NA       0.00      0.00      0.00        61
+2026-03-29 18:05:44  INFO                accuracy                           0.99      8229
+2026-03-29 18:05:44  INFO               macro avg       0.66      0.67      0.67      8229
+2026-03-29 18:05:44  INFO            weighted avg       0.99      0.99      0.99      8229
+2026-03-29 18:05:44  INFO      Métriques sauvegardées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-29 18:05:44  INFO      BLOC 6 — Training RSF (input : 8 features + evenement_na + duree_jours)
+2026-03-29 18:05:45  INFO      RSF entraîné — C-index (train) : 0.9249
+2026-03-29 18:05:46  INFO      BLOC 7 — Calcul des scores de disponibilité
+2026-03-29 18:05:47  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-29 18:05:47  INFO      Distribution finale : {'Available': 41142}
+2026-03-29 18:05:47  INFO        Available    → 41142  (100.0%)
+2026-03-29 18:05:47  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-29 18:05:47  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (869 KB)
+2026-03-29 18:05:47  INFO      XGBoost JSON      → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\xgboost_model.json
+2026-03-29 18:05:47  INFO      TRAINING TERMINE  (6.7s)
+2026-03-29 18:05:47  INFO      ================================================================
+2026-03-29 18:05:47  INFO      Prochain RE-TRAINING dans 7h 54min  (intervalle=14j)
+2026-03-29 18:05:47  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-29 18:06:46  INFO      Scheduler arrêté.
+2026-03-29 19:28:29  INFO      Exécution immédiate au démarrage...
+2026-03-29 19:28:29  INFO        DEBUT DU TRAINING 
+2026-03-29 19:28:29  INFO      BLOC 1A : Extraction des données
+2026-03-29 19:28:29  INFO      MongoDB → 0 documents chargés
+2026-03-29 19:28:29  INFO      BLOC 1B : Filtrage et validation des données
+2026-03-29 19:28:29  INFO      BLOC 1B — Filtrage : 0 valides  |  0 rejetés
+2026-03-29 19:28:29  INFO        Sans historique            : 0
+2026-03-29 19:28:29  INFO        MSISDN invalide            : 0
+2026-03-29 19:28:29  INFO        Date invalide              : 0
+2026-03-29 19:28:29  INFO        Statuts nettoyés (0/16/34) : 0
+2026-03-29 19:28:29  INFO        Statut inconnu             : 0
+2026-03-29 19:28:29  INFO        Doublons exclus            : 0
+2026-03-29 19:28:29  INFO      BLOC 1C : Normalisation des statuts DLR
+2026-03-29 19:28:29  INFO      BLOC 1C — Normalisation : 0 événements normalisés (4→2, 8→2)
+2026-03-29 19:28:29  INFO      BLOC 1C — Regroupement : 0 MSISDNs uniques
+2026-03-29 19:28:29  INFO      BLOC 2 — Feature Engineering
+2026-03-29 19:28:29  ERROR     ERREUR TRAINING : 'label'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 777, in run_training
+    df_real = build_features(contacts)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 463, in build_features
+    log.info(f"Features → {len(df)} contacts  |  labels : {df['label'].value_counts().to_dict()}")
+                                                           ~~^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\frame.py", line 4113, in __getitem__
+    indexer = self.columns.get_loc(key)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\indexes\range.py", line 417, in get_loc
+    raise KeyError(key)
+KeyError: 'label'
+2026-03-29 19:28:29  INFO      Prochain RE-TRAINING dans 6h 31min  (intervalle=14j)
+2026-03-29 19:28:29  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-29 19:53:58  INFO      Scheduler arrêté.
+2026-03-29 19:54:02  INFO      Exécution immédiate au démarrage...
+2026-03-29 19:54:02  INFO        DEBUT DU TRAINING 
+2026-03-29 19:54:02  INFO      BLOC 1A : Extraction des données
+2026-03-29 19:54:08  INFO      MongoDB → 218225 documents chargés
+2026-03-29 19:54:08  INFO      BLOC 1B : Filtrage et validation des données
+2026-03-29 19:54:10  INFO      BLOC 1B — Filtrage : 53519 valides  |  164706 rejetés
+2026-03-29 19:54:10  INFO        Sans historique            : 117634
+2026-03-29 19:54:10  INFO        MSISDN invalide            : 0
+2026-03-29 19:54:10  INFO        Date invalide              : 0
+2026-03-29 19:54:10  INFO        Statuts nettoyés (0/16/34) : 47072
+2026-03-29 19:54:10  INFO        Statut inconnu             : 0
+2026-03-29 19:54:10  INFO        Doublons exclus            : 0
+2026-03-29 19:54:10  INFO      BLOC 1C : Normalisation des statuts DLR
+2026-03-29 19:54:10  INFO      BLOC 1C — Normalisation : 106685 événements normalisés (4→2, 8→2)
+2026-03-29 19:54:10  INFO      BLOC 1C — Regroupement : 41142 MSISDNs uniques
+2026-03-29 19:54:10  INFO      BLOC 2 — Feature Engineering
+2026-03-29 19:54:11  INFO      Features → 41142 contacts  |  labels : {'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-29 19:54:11  INFO      BLOC 3/4 — Encodage des labels
+2026-03-29 19:54:11  INFO      Dataset → 41142 contacts réels  labels={'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-29 19:54:11  INFO      BLOC 5 — Training XGBoost
+2026-03-29 19:54:11  INFO      XGBoost entraîné — top features :
+2026-03-29 19:54:11  INFO          echecs_consecutifs_max          0.4898
+2026-03-29 19:54:11  INFO          total_envois                    0.1391
+2026-03-29 19:54:11  INFO          taux_livraison                  0.1301
+2026-03-29 19:54:11  INFO          score_recence                   0.1198
+2026-03-29 19:54:11  INFO          taux_echec                      0.0693
+2026-03-29 19:54:11  INFO      BLOC 5B — Evaluation du modèle
+2026-03-29 19:54:12  INFO      BLOC 5B — Evaluation XGBoost (test split 20%, seed=99) :
+2026-03-29 19:54:12  INFO          Accuracy          : 0.9926
+2026-03-29 19:54:12  INFO          Precision (macro) : 0.6642
+2026-03-29 19:54:12  INFO          Recall    (macro) : 0.6667
+2026-03-29 19:54:12  INFO          F1-score  (macro) : 0.6654
+2026-03-29 19:54:12  INFO          AUC ROC   (macro) : 0.9557
+2026-03-29 19:54:12  INFO          Rapport par classe :
+2026-03-29 19:54:12  INFO                          precision    recall  f1-score   support
+2026-03-29 19:54:12  INFO               Available       1.00      1.00      1.00        16
+2026-03-29 19:54:12  INFO               Suspected       0.99      1.00      1.00      8152
+2026-03-29 19:54:12  INFO                      NA       0.00      0.00      0.00        61
+2026-03-29 19:54:12  INFO                accuracy                           0.99      8229
+2026-03-29 19:54:12  INFO               macro avg       0.66      0.67      0.67      8229
+2026-03-29 19:54:12  INFO            weighted avg       0.99      0.99      0.99      8229
+2026-03-29 19:54:12  INFO      Métriques sauvegardées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-29 19:54:12  INFO      BLOC 6 — Training RSF 
+2026-03-29 19:54:13  INFO      RSF entraîné — C-index (train) : 0.9249
+2026-03-29 19:54:14  INFO      BLOC 7 — Calcul des scores de disponibilité
+2026-03-29 19:54:15  INFO      Prédictions exportées → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-29 19:54:15  INFO      Distribution finale : {'Available': 41142}
+2026-03-29 19:54:15  INFO        Available    → 41142  (100.0%)
+2026-03-29 19:54:15  INFO      BLOC 8 — Sauvegarde du modèle
+2026-03-29 19:54:15  INFO      Modèle sauvegardé → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (869 KB)
+2026-03-29 19:54:15  INFO      XGBoost JSON      → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\xgboost_model.json
+2026-03-29 19:54:15  INFO      TRAINING TERMINE  (12.8s)
+2026-03-29 19:54:15  INFO      Prochain RE-TRAINING dans 6h 5min  (intervalle=14j)
+2026-03-29 19:54:15  INFO      Scheduler actif — training planifié chaque nuit à 02:00
+2026-03-30 00:26:46  INFO      Scheduler arrêté.
+2026-03-30 12:28:59  INFO      Exécution immédiate au démarrage...
+2026-03-30 12:28:59  INFO      ===== DEBUT TRAINING v6.0.0 =====
+2026-03-30 12:28:59  INFO      MongoDB → 0 documents chargés
+2026-03-30 12:28:59  INFO      BLOC 1B — 0 valides | 0 rejetés
+2026-03-30 12:28:59  INFO        Sans historique:0 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 12:28:59  INFO        Statuts nettoyés:0 | Inconnus:0 | Doublons:0
+2026-03-30 12:28:59  INFO      BLOC 1C — 0 événements normalisés (4→2, 8→2)
+2026-03-30 12:28:59  INFO      BLOC 1C — 0 MSISDNs uniques
+2026-03-30 12:28:59  ERROR     ERREUR TRAINING : 'label'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 570, in run_training
+    df_real           = build_features(contacts)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 310, in build_features
+    log.info(f"Features → {len(df)} contacts | labels : {df['label'].value_counts().to_dict()}")
+                                                         ~~^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\frame.py", line 4113, in __getitem__
+    indexer = self.columns.get_loc(key)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\indexes\range.py", line 417, in get_loc
+    raise KeyError(key)
+KeyError: 'label'
+2026-03-30 12:28:59  INFO      Prochain RE-TRAINING dans 13h 31min
+2026-03-30 12:28:59  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 12:29:59  INFO      Scheduler arrêté.
+2026-03-30 12:30:02  INFO      Exécution immédiate au démarrage...
+2026-03-30 12:30:02  INFO      ===== DEBUT TRAINING v6.0.0 =====
+2026-03-30 12:30:02  INFO      MongoDB → 0 documents chargés
+2026-03-30 12:30:02  INFO      BLOC 1B — 0 valides | 0 rejetés
+2026-03-30 12:30:02  INFO        Sans historique:0 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 12:30:02  INFO        Statuts nettoyés:0 | Inconnus:0 | Doublons:0
+2026-03-30 12:30:02  INFO      BLOC 1C — 0 événements normalisés (4→2, 8→2)
+2026-03-30 12:30:02  INFO      BLOC 1C — 0 MSISDNs uniques
+2026-03-30 12:30:02  ERROR     ERREUR TRAINING : 'label'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 570, in run_training
+    df_real           = build_features(contacts)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 310, in build_features
+    log.info(f"Features → {len(df)} contacts | labels : {df['label'].value_counts().to_dict()}")
+                                                         ~~^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\frame.py", line 4113, in __getitem__
+    indexer = self.columns.get_loc(key)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\indexes\range.py", line 417, in get_loc
+    raise KeyError(key)
+KeyError: 'label'
+2026-03-30 12:30:02  INFO      Prochain RE-TRAINING dans 13h 29min
+2026-03-30 12:30:02  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 12:30:40  INFO      Scheduler arrêté.
+2026-03-30 12:30:44  INFO      Exécution immédiate au démarrage...
+2026-03-30 12:30:44  INFO      ===== DEBUT TRAINING v6.0.0 =====
+2026-03-30 12:30:44  INFO      MongoDB → 0 documents chargés
+2026-03-30 12:30:44  INFO      BLOC 1B — 0 valides | 0 rejetés
+2026-03-30 12:30:44  INFO        Sans historique:0 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 12:30:44  INFO        Statuts nettoyés:0 | Inconnus:0 | Doublons:0
+2026-03-30 12:30:44  INFO      BLOC 1C — 0 événements normalisés (4→2, 8→2)
+2026-03-30 12:30:44  INFO      BLOC 1C — 0 MSISDNs uniques
+2026-03-30 12:30:44  ERROR     ERREUR TRAINING : 'label'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 570, in run_training
+    df_real           = build_features(contacts)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 310, in build_features
+    log.info(f"Features → {len(df)} contacts | labels : {df['label'].value_counts().to_dict()}")
+                                                         ~~^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\frame.py", line 4113, in __getitem__
+    indexer = self.columns.get_loc(key)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\indexes\range.py", line 417, in get_loc
+    raise KeyError(key)
+KeyError: 'label'
+2026-03-30 12:30:44  INFO      Prochain RE-TRAINING dans 13h 29min
+2026-03-30 12:30:44  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 12:31:25  INFO      Scheduler arrêté.
+2026-03-30 12:31:29  INFO      Exécution immédiate au démarrage...
+2026-03-30 12:31:29  INFO      ===== DEBUT TRAINING v6.0.0 =====
+2026-03-30 12:31:29  INFO      MongoDB → 0 documents chargés
+2026-03-30 12:31:29  INFO      BLOC 1B — 0 valides | 0 rejetés
+2026-03-30 12:31:29  INFO        Sans historique:0 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 12:31:29  INFO        Statuts nettoyés:0 | Inconnus:0 | Doublons:0
+2026-03-30 12:31:29  INFO      BLOC 1C — 0 événements normalisés (4→2, 8→2)
+2026-03-30 12:31:29  INFO      BLOC 1C — 0 MSISDNs uniques
+2026-03-30 12:31:29  ERROR     ERREUR TRAINING : 'label'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 570, in run_training
+    df_real           = build_features(contacts)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 310, in build_features
+    log.info(f"Features → {len(df)} contacts | labels : {df['label'].value_counts().to_dict()}")
+                                                         ~~^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\frame.py", line 4113, in __getitem__
+    indexer = self.columns.get_loc(key)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pandas\core\indexes\range.py", line 417, in get_loc
+    raise KeyError(key)
+KeyError: 'label'
+2026-03-30 12:31:29  INFO      Prochain RE-TRAINING dans 13h 28min
+2026-03-30 12:31:29  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 12:37:12  INFO      Scheduler arrêté.
+2026-03-30 12:37:16  INFO      Exécution immédiate au démarrage...
+2026-03-30 12:37:16  INFO      ===== DEBUT TRAINING v6.0.0 =====
+2026-03-30 12:37:19  INFO      MongoDB → 218225 documents chargés
+2026-03-30 12:37:21  INFO      BLOC 1B — 53519 valides | 164706 rejetés
+2026-03-30 12:37:21  INFO        Sans historique:117634 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 12:37:21  INFO        Statuts nettoyés:47072 | Inconnus:0 | Doublons:0
+2026-03-30 12:37:21  INFO      BLOC 1C — 106685 événements normalisés (4→2, 8→2)
+2026-03-30 12:37:21  INFO      BLOC 1C — 41142 MSISDNs uniques
+2026-03-30 12:37:22  INFO      Features → 41142 contacts | labels : {'Suspected': 41061, 'Available': 81}
+2026-03-30 12:37:22  INFO      Dataset → 41142 contacts | labels={'Suspected': 41061, 'Available': 81}
+2026-03-30 12:37:22  INFO      Splits XGBoost : train=27976 | val_ES=4937 | test=8229
+2026-03-30 12:37:22  INFO      XGBoost entraîné — 166 arbres — feature importances :
+2026-03-30 12:37:22  INFO          taux_livraison                0.2522
+2026-03-30 12:37:22  INFO          taux_livraison_recent         0.2195
+2026-03-30 12:37:22  INFO          jours_depuis_succes           0.1710
+2026-03-30 12:37:22  INFO          total_envois                  0.1522
+2026-03-30 12:37:22  INFO          score_recence                 0.1432
+2026-03-30 12:37:22  INFO          echecs_consecutifs_max        0.0565
+2026-03-30 12:37:22  INFO          freq_inter_envoi_jours        0.0053
+2026-03-30 12:37:22  ERROR     ERREUR TRAINING : Classification metrics can't handle a mix of binary and multilabel-indicator targets
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 574, in run_training
+    eval_metrics               = evaluate_model(xgb_model, X_test, y_test, label_map)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 388, in evaluate_model
+    acc  = accuracy_score(y_test, y_pred)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\sklearn\utils\_param_validation.py", line 218, in wrapper
+    return func(*args, **kwargs)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\sklearn\metrics\_classification.py", line 411, in accuracy_score
+    y_type, y_true, y_pred, sample_weight = _check_targets(
+                                            ~~~~~~~~~~~~~~^
+        y_true, y_pred, sample_weight
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\sklearn\metrics\_classification.py", line 127, in _check_targets
+    raise ValueError(
+    ...<3 lines>...
+    )
+ValueError: Classification metrics can't handle a mix of binary and multilabel-indicator targets
+2026-03-30 12:37:23  INFO      Prochain RE-TRAINING dans 13h 22min
+2026-03-30 12:37:23  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 12:43:04  INFO      Scheduler arrêté.
+2026-03-30 12:43:08  INFO      Exécution immédiate au démarrage...
+2026-03-30 12:43:08  INFO      ===== DEBUT TRAINING v6.0.0 =====
+2026-03-30 12:43:11  INFO      MongoDB → 218225 documents chargés
+2026-03-30 12:43:13  INFO      BLOC 1B — 53519 valides | 164706 rejetés
+2026-03-30 12:43:13  INFO        Sans historique:117634 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 12:43:13  INFO        Statuts nettoyés:47072 | Inconnus:0 | Doublons:0
+2026-03-30 12:43:13  INFO      BLOC 1C — 106685 événements normalisés (4→2, 8→2)
+2026-03-30 12:43:13  INFO      BLOC 1C — 41142 MSISDNs uniques
+2026-03-30 12:43:14  INFO      Features → 41142 contacts | labels : {'Suspected': 41061, 'Available': 81}
+2026-03-30 12:43:14  INFO      Dataset → 41142 contacts | labels={'Suspected': 41061, 'Available': 81}
+2026-03-30 12:43:14  INFO      Splits XGBoost : train=27976 | val_ES=4937 | test=8229
+2026-03-30 12:43:14  INFO      XGBoost entraîné — 166 arbres — feature importances :
+2026-03-30 12:43:14  INFO          taux_livraison                0.2522
+2026-03-30 12:43:14  INFO          taux_livraison_recent         0.2195
+2026-03-30 12:43:14  INFO          jours_depuis_succes           0.1710
+2026-03-30 12:43:14  INFO          total_envois                  0.1522
+2026-03-30 12:43:14  INFO          score_recence                 0.1432
+2026-03-30 12:43:14  INFO          echecs_consecutifs_max        0.0565
+2026-03-30 12:43:14  INFO          freq_inter_envoi_jours        0.0053
+2026-03-30 12:43:14  ERROR     ERREUR TRAINING : Classification metrics can't handle a mix of binary and multilabel-indicator targets
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 574, in run_training
+    eval_metrics               = evaluate_model(xgb_model, X_test, y_test, label_map)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 388, in evaluate_model
+    acc  = accuracy_score(y_test, y_pred)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\sklearn\utils\_param_validation.py", line 218, in wrapper
+    return func(*args, **kwargs)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\sklearn\metrics\_classification.py", line 411, in accuracy_score
+    y_type, y_true, y_pred, sample_weight = _check_targets(
+                                            ~~~~~~~~~~~~~~^
+        y_true, y_pred, sample_weight
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\sklearn\metrics\_classification.py", line 127, in _check_targets
+    raise ValueError(
+    ...<3 lines>...
+    )
+ValueError: Classification metrics can't handle a mix of binary and multilabel-indicator targets
+2026-03-30 12:43:14  INFO      Prochain RE-TRAINING dans 13h 16min
+2026-03-30 12:43:14  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 12:54:37  INFO      Scheduler arrêté.
+2026-03-30 12:58:33  INFO      ===== DEBUT TRAINING =====
+2026-03-30 12:58:33  INFO      Génération de 200 contacts fictifs pour le test...
+2026-03-30 12:58:33  INFO      BLOC 1B — 200 valides | 0 rejetés
+2026-03-30 12:58:33  INFO      Training terminé. Résultats sauvegardés dans C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-30 12:58:33  INFO      Distribution : {'Available': 200}
+2026-03-30 13:02:34  INFO      ===== DEBUT TRAINING =====
+2026-03-30 13:02:34  INFO      Génération de 200 contacts fictifs pour le test...
+2026-03-30 13:02:34  INFO      BLOC 1B — 200 valides | 0 rejetés
+2026-03-30 13:02:35  INFO      Training terminé. Résultats sauvegardés dans C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-30 13:02:35  INFO      Distribution : {'Available': 200}
+2026-03-30 13:05:47  INFO      ===== DEBUT TRAINING (SOURCE: MONGODB) =====
+2026-03-30 13:05:54  INFO      MongoDB → 218225 documents chargés
+2026-03-30 13:05:57  INFO      BLOC 1B — 53519 valides | 164706 rejetés
+2026-03-30 13:06:03  INFO      Training terminé. Résultats sauvegardés dans C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-03-30 13:15:49  INFO      ===== DEBUT TRAINING (MONGODB) =====
+2026-03-30 13:15:56  INFO      MongoDB → 218225 documents chargés
+2026-03-30 13:15:59  INFO      Filtrage terminé : 53519 contacts valides
+2026-03-30 13:16:03  INFO      Modèle sauvegardé : C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-30 13:16:03  INFO      ===== TRAINING TERMINE =====
+2026-03-30 14:02:59  INFO      ===== DEBUT TRAINING (MONGODB) =====
+2026-03-30 14:03:02  INFO      MongoDB → 218225 documents chargés
+2026-03-30 14:03:03  INFO      Filtrage terminé : 53519 contacts valides
+2026-03-30 14:03:04  INFO      Modèle sauvegardé : C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-30 14:03:04  INFO      ===== TRAINING TERMINE =====
+2026-03-30 14:03:28  INFO      ===== DEBUT TRAINING (MONGODB) =====
+2026-03-30 14:03:30  INFO      MongoDB → 218225 documents chargés
+2026-03-30 14:03:31  INFO      Filtrage terminé : 53519 contacts valides
+2026-03-30 14:03:32  INFO      Modèle sauvegardé : C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-30 14:03:32  INFO      ===== TRAINING TERMINE =====
+2026-03-30 14:16:42  INFO      ===== DEBUT TRAINING (MONGODB) =====
+2026-03-30 14:16:44  INFO      MongoDB → 218225 documents chargés
+2026-03-30 14:16:45  INFO      Filtrage terminé : 53519 contacts valides
+2026-03-30 14:16:46  INFO      Modèle sauvegardé : C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl
+2026-03-30 14:16:46  INFO      ===== TRAINING TERMINE =====
+2026-03-30 14:19:36  INFO      Exécution immédiate au démarrage...
+2026-03-30 14:19:36  INFO      ===== DEBUT TRAINING v7.0.0 =====
+2026-03-30 14:19:36  INFO      JSON → 138 documents chargés
+2026-03-30 14:19:36  INFO      BLOC 1B — 136 valides | 2 rejetés
+2026-03-30 14:19:36  INFO        Sans historique:2 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 14:19:36  INFO        Statuts nettoyés:5 | Inconnus:0 | Doublons:0
+2026-03-30 14:19:36  INFO      BLOC 1C — 184 événements normalisés (4→2, 8→2)
+2026-03-30 14:19:36  INFO      BLOC 1C — 107 MSISDNs uniques
+2026-03-30 14:19:36  INFO      Features → 107 contacts | labels : {'Available': 66, 'Suspected': 37, 'NA': 4}
+2026-03-30 14:19:36  INFO      Dataset → 107 contacts | labels={'Available': 66, 'Suspected': 37, 'NA': 4}
+2026-03-30 14:19:36  INFO      Splits XGBoost : train=72 | val_ES=13 | test=22
+2026-03-30 14:19:36  WARNING   Optuna absent → fallback GridSearch partiel
+2026-03-30 14:19:38  INFO      GridSearch fallback terminé | meilleur F1-macro val=0.6296
+2026-03-30 14:19:38  INFO        Meilleurs hyperparamètres : {'n_estimators': 400, 'subsample': 0.8, 'colsample_bytree': 0.75, 'gamma': 0.15, 'reg_alpha': 0.15, 'reg_lambda': 1.2, 'max_depth': 3, 'learning_rate': 0.03, 'min_child_weight': 3}
+2026-03-30 14:19:38  INFO      XGBoost entraîné — 390 arbres — feature importances :
+2026-03-30 14:19:38  INFO          echecs_consecutifs_max        0.3395
+2026-03-30 14:19:38  INFO          taux_livraison                0.2505
+2026-03-30 14:19:38  INFO          score_recence                 0.1545
+2026-03-30 14:19:38  INFO          total_envois                  0.1264
+2026-03-30 14:19:38  INFO          freq_inter_envoi_jours        0.0769
+2026-03-30 14:19:38  INFO          taux_livraison_recent         0.0364
+2026-03-30 14:19:38  INFO          jours_depuis_succes           0.0159
+2026-03-30 14:19:38  INFO      BLOC 5B — Evaluation XGBoost (test 20%, seed=42, jamais vu) :
+2026-03-30 14:19:38  INFO          N=22  Acc=0.9545  Prec=0.6296  Rec=0.6667  F1=0.6471
+2026-03-30 14:19:38  INFO          AUC=1.0000
+2026-03-30 14:19:38  INFO                          precision    recall  f1-score   support
+2026-03-30 14:19:38  INFO               Available       1.00      1.00      1.00        13
+2026-03-30 14:19:38  INFO               Suspected       0.89      1.00      0.94         8
+2026-03-30 14:19:38  INFO                      NA       0.00      0.00      0.00         1
+2026-03-30 14:19:38  INFO                accuracy                           0.95        22
+2026-03-30 14:19:38  INFO               macro avg       0.63      0.67      0.65        22
+2026-03-30 14:19:38  INFO            weighted avg       0.91      0.95      0.93        22
+2026-03-30 14:19:38  INFO      Métriques → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-30 14:19:39  INFO      RSF — C-index train=0.9930 | eval(honnête)=1.0000
+2026-03-30 14:19:39  INFO      Distribution finale (107 contacts) :
+2026-03-30 14:19:39  INFO        Available    →  107  (100.0%)
+2026-03-30 14:19:39  INFO      Modèle v7.0.0 → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (981 KB)
+2026-03-30 14:19:39  INFO      ===== TRAINING TERMINE (2.8s) =====
+2026-03-30 14:19:39  INFO      Prochain RE-TRAINING dans 11h 40min
+2026-03-30 14:19:39  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 14:21:29  INFO      Scheduler arrêté.
+2026-03-30 14:21:32  INFO      Exécution immédiate au démarrage...
+2026-03-30 14:21:32  INFO      ===== DEBUT TRAINING v7.0.0 =====
+2026-03-30 14:21:32  INFO      JSON → 138 documents chargés
+2026-03-30 14:21:32  INFO      BLOC 1B — 136 valides | 2 rejetés
+2026-03-30 14:21:32  INFO        Sans historique:2 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 14:21:32  INFO        Statuts nettoyés:5 | Inconnus:0 | Doublons:0
+2026-03-30 14:21:32  INFO      BLOC 1C — 184 événements normalisés (4→2, 8→2)
+2026-03-30 14:21:32  INFO      BLOC 1C — 107 MSISDNs uniques
+2026-03-30 14:21:32  INFO      Features → 107 contacts | labels : {'Available': 66, 'Suspected': 37, 'NA': 4}
+2026-03-30 14:21:32  INFO      Dataset → 107 contacts | labels={'Available': 66, 'Suspected': 37, 'NA': 4}
+2026-03-30 14:21:32  INFO      Splits XGBoost : train=72 | val_ES=13 | test=22
+2026-03-30 14:21:32  INFO      Optuna disponible → lancement du tuning bayésien (50 trials)...
+2026-03-30 14:21:38  INFO      Optuna tuning terminé — 50 trials | meilleur F1-macro val=0.6296
+2026-03-30 14:21:38  INFO        Meilleurs hyperparamètres : {'n_estimators': 350, 'max_depth': 7, 'learning_rate': 0.05395030966670229, 'subsample': 0.8095304694689628, 'colsample_bytree': 0.5702083881990965, 'min_child_weight': 3, 'gamma': 0.02904180608409973, 'reg_alpha': 0.4330880728874676, 'reg_lambda': 1.4016725176148133}
+2026-03-30 14:21:38  INFO      XGBoost entraîné — 350 arbres — feature importances :
+2026-03-30 14:21:38  INFO          echecs_consecutifs_max        0.2475
+2026-03-30 14:21:38  INFO          taux_livraison_recent         0.2359
+2026-03-30 14:21:38  INFO          taux_livraison                0.1523
+2026-03-30 14:21:38  INFO          total_envois                  0.1488
+2026-03-30 14:21:38  INFO          score_recence                 0.1446
+2026-03-30 14:21:38  INFO          freq_inter_envoi_jours        0.0579
+2026-03-30 14:21:38  INFO          jours_depuis_succes           0.0130
+2026-03-30 14:21:38  INFO      BLOC 5B — Evaluation XGBoost (test 20%, seed=42, jamais vu) :
+2026-03-30 14:21:38  INFO          N=22  Acc=0.9545  Prec=0.6296  Rec=0.6667  F1=0.6471
+2026-03-30 14:21:38  INFO          AUC=1.0000
+2026-03-30 14:21:38  INFO                          precision    recall  f1-score   support
+2026-03-30 14:21:38  INFO               Available       1.00      1.00      1.00        13
+2026-03-30 14:21:38  INFO               Suspected       0.89      1.00      0.94         8
+2026-03-30 14:21:38  INFO                      NA       0.00      0.00      0.00         1
+2026-03-30 14:21:38  INFO                accuracy                           0.95        22
+2026-03-30 14:21:38  INFO               macro avg       0.63      0.67      0.65        22
+2026-03-30 14:21:38  INFO            weighted avg       0.91      0.95      0.93        22
+2026-03-30 14:21:38  INFO      Métriques → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-30 14:21:38  INFO      RSF — C-index train=0.9930 | eval(honnête)=1.0000
+2026-03-30 14:21:38  INFO      Distribution finale (107 contacts) :
+2026-03-30 14:21:38  INFO        Available    →  107  (100.0%)
+2026-03-30 14:21:38  INFO      Modèle v7.0.0 → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (873 KB)
+2026-03-30 14:21:38  INFO      ===== TRAINING TERMINE (6.2s) =====
+2026-03-30 14:21:38  INFO      Prochain RE-TRAINING dans 11h 38min
+2026-03-30 14:21:38  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 14:22:16  INFO      Scheduler arrêté.
+2026-03-30 14:22:18  INFO      Exécution immédiate au démarrage...
+2026-03-30 14:22:18  INFO      ===== DEBUT TRAINING v7.0.0 =====
+2026-03-30 14:22:21  INFO      MongoDB → 218225 documents chargés
+2026-03-30 14:22:22  INFO      BLOC 1B — 53519 valides | 164706 rejetés
+2026-03-30 14:22:22  INFO        Sans historique:117634 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 14:22:22  INFO        Statuts nettoyés:47072 | Inconnus:0 | Doublons:0
+2026-03-30 14:22:22  INFO      BLOC 1C — 106685 événements normalisés (4→2, 8→2)
+2026-03-30 14:22:22  INFO      BLOC 1C — 41142 MSISDNs uniques
+2026-03-30 14:22:22  INFO      Features → 41142 contacts | labels : {'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-30 14:22:22  INFO      Dataset → 41142 contacts | labels={'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-30 14:22:22  INFO      Splits XGBoost : train=27976 | val_ES=4937 | test=8229
+2026-03-30 14:22:22  INFO      Optuna disponible → lancement du tuning bayésien (50 trials)...
+2026-03-30 14:22:55  INFO      Optuna tuning terminé — 50 trials | meilleur F1-macro val=0.6654
+2026-03-30 14:22:55  INFO        Meilleurs hyperparamètres : {'n_estimators': 350, 'max_depth': 7, 'learning_rate': 0.05395030966670229, 'subsample': 0.8095304694689628, 'colsample_bytree': 0.5702083881990965, 'min_child_weight': 3, 'gamma': 0.02904180608409973, 'reg_alpha': 0.4330880728874676, 'reg_lambda': 1.4016725176148133}
+2026-03-30 14:22:55  INFO      XGBoost entraîné — 347 arbres — feature importances :
+2026-03-30 14:22:55  INFO          taux_livraison_recent         0.3725
+2026-03-30 14:22:55  INFO          total_envois                  0.1367
+2026-03-30 14:22:55  INFO          taux_livraison                0.1298
+2026-03-30 14:22:55  INFO          echecs_consecutifs_max        0.1247
+2026-03-30 14:22:55  INFO          freq_inter_envoi_jours        0.1118
+2026-03-30 14:22:55  INFO          score_recence                 0.1019
+2026-03-30 14:22:55  INFO          jours_depuis_succes           0.0227
+2026-03-30 14:22:56  INFO      BLOC 5B — Evaluation XGBoost (test 20%, seed=42, jamais vu) :
+2026-03-30 14:22:56  INFO          N=8229  Acc=0.9926  Prec=0.6642  Rec=0.6667  F1=0.6654
+2026-03-30 14:22:56  INFO          AUC=0.8459
+2026-03-30 14:22:56  INFO                          precision    recall  f1-score   support
+2026-03-30 14:22:56  INFO               Available       1.00      1.00      1.00        16
+2026-03-30 14:22:56  INFO               Suspected       0.99      1.00      1.00      8152
+2026-03-30 14:22:56  INFO                      NA       0.00      0.00      0.00        61
+2026-03-30 14:22:56  INFO                accuracy                           0.99      8229
+2026-03-30 14:22:56  INFO               macro avg       0.66      0.67      0.67      8229
+2026-03-30 14:22:56  INFO            weighted avg       0.99      0.99      0.99      8229
+2026-03-30 14:22:56  INFO      Métriques → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-30 14:22:56  INFO      RSF — C-index train=0.7400 | eval(honnête)=0.7442
+2026-03-30 14:22:58  INFO      Distribution finale (41142 contacts) :
+2026-03-30 14:22:58  INFO        Available    → 41142  (100.0%)
+2026-03-30 14:22:58  INFO      Modèle v7.0.0 → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (1052 KB)
+2026-03-30 14:22:58  INFO      ===== TRAINING TERMINE (39.9s) =====
+2026-03-30 14:22:58  INFO      Prochain RE-TRAINING dans 11h 37min
+2026-03-30 14:22:58  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 14:23:03  INFO      Scheduler arrêté.
+2026-03-30 14:34:47  INFO      Exécution immédiate au démarrage...
+2026-03-30 14:34:47  INFO      ===== DEBUT TRAINING v7.0.0 =====
+2026-03-30 14:34:51  INFO      MongoDB → 218225 documents chargés
+2026-03-30 14:34:52  INFO      BLOC 1B — 53519 valides | 164706 rejetés
+2026-03-30 14:34:52  INFO        Sans historique:117634 | MSISDN invalide:0 | Date invalide:0
+2026-03-30 14:34:52  INFO        Statuts nettoyés:47072 | Inconnus:0 | Doublons:0
+2026-03-30 14:34:52  INFO      BLOC 1C — 106685 événements normalisés (4→2, 8→2)
+2026-03-30 14:34:52  INFO      BLOC 1C — 41142 MSISDNs uniques
+2026-03-30 14:34:53  INFO      Features → 41142 contacts | labels : {'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-30 14:34:53  INFO      Dataset → 41142 contacts | labels={'Suspected': 40755, 'NA': 306, 'Available': 81}
+2026-03-30 14:34:53  INFO      Splits XGBoost : train=27976 | val_ES=4937 | test=8229
+2026-03-30 14:34:53  INFO      Optuna disponible → lancement du tuning bayésien (50 trials)...
+2026-03-30 14:37:07  INFO      Optuna tuning terminé — 50 trials | meilleur F1-macro val=0.6654
+2026-03-30 14:37:07  INFO        Meilleurs hyperparamètres : {'n_estimators': 350, 'max_depth': 7, 'learning_rate': 0.05395030966670229, 'subsample': 0.8095304694689628, 'colsample_bytree': 0.5702083881990965, 'min_child_weight': 3, 'gamma': 0.02904180608409973, 'reg_alpha': 0.4330880728874676, 'reg_lambda': 1.4016725176148133}
+2026-03-30 14:37:10  INFO      XGBoost entraîné — 347 arbres — feature importances :
+2026-03-30 14:37:10  INFO          taux_livraison_recent         0.3725
+2026-03-30 14:37:10  INFO          total_envois                  0.1367
+2026-03-30 14:37:10  INFO          taux_livraison                0.1298
+2026-03-30 14:37:10  INFO          echecs_consecutifs_max        0.1247
+2026-03-30 14:37:10  INFO          freq_inter_envoi_jours        0.1118
+2026-03-30 14:37:10  INFO          score_recence                 0.1019
+2026-03-30 14:37:10  INFO          jours_depuis_succes           0.0227
+2026-03-30 14:37:11  INFO      BLOC 5B — Evaluation XGBoost (test 20%, seed=42, jamais vu) :
+2026-03-30 14:37:11  INFO          N=8229  Acc=0.9926  Prec=0.6642  Rec=0.6667  F1=0.6654
+2026-03-30 14:37:11  INFO          AUC=0.8459
+2026-03-30 14:37:11  INFO                          precision    recall  f1-score   support
+2026-03-30 14:37:11  INFO               Available       1.00      1.00      1.00        16
+2026-03-30 14:37:11  INFO               Suspected       0.99      1.00      1.00      8152
+2026-03-30 14:37:11  INFO                      NA       0.00      0.00      0.00        61
+2026-03-30 14:37:11  INFO                accuracy                           0.99      8229
+2026-03-30 14:37:11  INFO               macro avg       0.66      0.67      0.67      8229
+2026-03-30 14:37:11  INFO            weighted avg       0.99      0.99      0.99      8229
+2026-03-30 14:37:11  INFO      Métriques → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-03-30 14:37:13  INFO      RSF — C-index train=0.7400 | eval(honnête)=0.7442
+2026-03-30 14:37:22  INFO      Distribution finale (41142 contacts) :
+2026-03-30 14:37:22  INFO        Available    → 41142  (100.0%)
+2026-03-30 14:37:22  INFO      Modèle v7.0.0 → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (1052 KB)
+2026-03-30 14:37:22  INFO      ===== TRAINING TERMINE (154.5s) =====
+2026-03-30 14:37:22  INFO      Prochain RE-TRAINING dans 11h 22min
+2026-03-30 14:37:22  INFO      Scheduler actif — training planifié à 02:00
+2026-03-30 16:28:18  INFO      Scheduler arrêté.
+2026-04-01 13:44:33  INFO      Exécution immédiate au démarrage...
+2026-04-01 13:44:33  INFO      ===== DEBUT TRAINING v7.0.0 =====
+2026-04-01 13:45:04  ERROR     ERREUR TRAINING : localhost:27017: [WinError 10061] Aucune connexion n’a pu être établie car l’ordinateur cible l’a expressément refusée (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 30s, Topology Description: <TopologyDescription id: 69cd13314bbb84eb2fffe78f, topology_type: Unknown, servers: [<ServerDescription ('localhost', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('localhost:27017: [WinError 10061] Aucune connexion n’a pu être établie car l’ordinateur cible l’a expressément refusée (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms)')>]>
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 725, in run_training
+    raw = load_from_mongodb() if CONFIG['USE_MONGODB'] else load_from_json()
+          ~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 91, in load_from_mongodb
+    records = list(col.find({}, {'_id': 0}))
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\cursor.py", line 1289, in __next__
+    return self.next()
+           ~~~~~~~~~^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\cursor.py", line 1265, in next
+    if len(self._data) or self._refresh():
+                          ~~~~~~~~~~~~~^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\cursor.py", line 1213, in _refresh
+    self._send_message(q)
+    ~~~~~~~~~~~~~~~~~~^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\cursor.py", line 1108, in _send_message
+    response = client._run_operation(
+        operation, self._unpack_response, address=self._address
+    )
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\_csot.py", line 125, in csot_wrapper
+    return func(self, *args, **kwargs)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\mongo_client.py", line 1938, in _run_operation
+    return self._retryable_read(
+           ~~~~~~~~~~~~~~~~~~~~^
+        _cmd,
+        ^^^^^
+    ...<4 lines>...
+        operation=operation.name,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\mongo_client.py", line 2048, in _retryable_read
+    return self._retry_internal(
+           ~~~~~~~~~~~~~~~~~~~~^
+        func,
+        ^^^^^
+    ...<7 lines>...
+        operation_id=operation_id,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\_csot.py", line 125, in csot_wrapper
+    return func(self, *args, **kwargs)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\mongo_client.py", line 2014, in _retry_internal
+    ).run()
+      ~~~^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\mongo_client.py", line 2763, in run
+    return self._read() if self._is_read else self._write()
+           ~~~~~~~~~~^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\mongo_client.py", line 2908, in _read
+    self._server = self._get_server()
+                   ~~~~~~~~~~~~~~~~^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\mongo_client.py", line 2856, in _get_server
+    return self._client._select_server(
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+        self._server_selector,
+        ^^^^^^^^^^^^^^^^^^^^^^
+    ...<4 lines>...
+        operation_id=self._operation_id,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\mongo_client.py", line 1833, in _select_server
+    server = topology.select_server(
+        server_selector,
+    ...<2 lines>...
+        operation_id=operation_id,
+    )
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\topology.py", line 428, in select_server
+    server = self._select_server(
+        selector,
+    ...<4 lines>...
+        operation_id=operation_id,
+    )
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\topology.py", line 402, in _select_server
+    servers = self.select_servers(
+        selector,
+    ...<4 lines>...
+        deprioritized_servers,
+    )
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\topology.py", line 298, in select_servers
+    server_descriptions = self._select_servers_loop(
+        selector,
+    ...<4 lines>...
+        deprioritized_servers=deprioritized_servers,
+    )
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\pymongo\synchronous\topology.py", line 359, in _select_servers_loop
+    raise ServerSelectionTimeoutError(
+        f"{self._error_message(selector)}, Timeout: {timeout}s, Topology Description: {self.description!r}"
+    )
+pymongo.errors.ServerSelectionTimeoutError: localhost:27017: [WinError 10061] Aucune connexion n’a pu être établie car l’ordinateur cible l’a expressément refusée (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms), Timeout: 30s, Topology Description: <TopologyDescription id: 69cd13314bbb84eb2fffe78f, topology_type: Unknown, servers: [<ServerDescription ('localhost', 27017) server_type: Unknown, rtt: None, error=AutoReconnect('localhost:27017: [WinError 10061] Aucune connexion n’a pu être établie car l’ordinateur cible l’a expressément refusée (configured timeouts: socketTimeoutMS: 20000.0ms, connectTimeoutMS: 20000.0ms)')>]>
+2026-04-01 13:45:04  INFO      Prochain RE-TRAINING dans 12h 14min
+2026-04-01 13:45:04  INFO      Scheduler actif — training planifié à 02:00
+2026-04-01 14:21:06  INFO      Scheduler arrêté.
+2026-04-04 12:51:35  INFO      JSON → 138 documents chargés
+2026-04-04 12:51:35  INFO      BLOC 1B — 135 valides | 3 rejetés
+2026-04-04 12:51:35  INFO        MSISDN invalide:0 | Date finale invalide:2
+2026-04-04 12:51:35  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:1
+2026-04-04 12:51:35  INFO      BLOC 1C — 4 événements normalisés (4→2, 8→2)
+2026-04-04 12:51:35  INFO      BLOC 1C — 107 MSISDNs uniques
+2026-04-04 13:19:49  INFO      ===== DEBUT TRAINING v7.0.0 =====
+2026-04-04 13:19:49  INFO      JSON → 138 documents chargés
+2026-04-04 13:19:49  INFO      Features → 107 contacts | labels : {'Available': 67, 'Suspected': 36, 'NA': 4}
+2026-04-04 13:19:49  INFO      BLOC 1B — 135 valides | 3 rejetés
+2026-04-04 13:19:49  INFO        MSISDN invalide:0 | Date finale invalide:2
+2026-04-04 13:19:49  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:1
+2026-04-04 13:19:49  INFO      BLOC 1C — 4 événements normalisés (4→2, 8→2)
+2026-04-04 13:19:49  INFO      BLOC 1C — 107 MSISDNs uniques
+2026-04-04 13:19:49  INFO      Features → 107 contacts | labels : {'Available': 92, 'Suspected': 11, 'NA': 4}
+2026-04-04 13:19:53  INFO      MongoDB → 218225 documents chargés
+2026-04-04 13:19:54  INFO      BLOC 1B — 96528 valides | 121697 rejetés
+2026-04-04 13:19:54  INFO        MSISDN invalide:0 | Date finale invalide:121693
+2026-04-04 13:19:54  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:4
+2026-04-04 13:19:54  INFO      BLOC 1C — 45323 événements normalisés (4→2, 8→2)
+2026-04-04 13:19:54  INFO      BLOC 1C — 79175 MSISDNs uniques
+2026-04-04 13:19:55  INFO      Features → 79175 contacts | labels : {'NA': 38339, 'Suspected': 34467, 'Available': 6369}
+2026-04-04 13:19:55  INFO      Dataset → 79175 contacts | labels={'NA': 38339, 'Suspected': 34467, 'Available': 6369}
+2026-04-04 13:19:55  INFO      Splits XGBoost : train=53839 | val_ES=9501 | test=15835
+2026-04-04 13:19:56  INFO      Optuna disponible → lancement du tuning bayésien (50 trials)...
+2026-04-04 13:25:07  INFO      Optuna tuning terminé — 50 trials | meilleur F1-macro val=1.0000
+2026-04-04 13:25:07  INFO        Meilleurs hyperparamètres : {'n_estimators': 350, 'max_depth': 7, 'learning_rate': 0.05395030966670229, 'subsample': 0.8095304694689628, 'colsample_bytree': 0.5702083881990965, 'min_child_weight': 3, 'gamma': 0.02904180608409973, 'reg_alpha': 0.4330880728874676, 'reg_lambda': 1.4016725176148133}
+2026-04-04 13:25:13  INFO      XGBoost entraîné — 350 arbres — feature importances :
+2026-04-04 13:25:13  INFO          score_recence                 0.2962
+2026-04-04 13:25:13  INFO          echecs_consecutifs_max        0.2424
+2026-04-04 13:25:13  INFO          taux_livraison_recent         0.1801
+2026-04-04 13:25:13  INFO          taux_livraison                0.1257
+2026-04-04 13:25:13  INFO          jours_depuis_succes           0.0926
+2026-04-04 13:25:13  INFO          freq_inter_envoi_jours        0.0439
+2026-04-04 13:25:13  INFO          total_envois                  0.0191
+2026-04-04 13:25:14  INFO      BLOC 5B — Evaluation XGBoost (test 20%, seed=42, jamais vu) :
+2026-04-04 13:25:14  INFO          N=15835  Acc=1.0000  Prec=1.0000  Rec=1.0000  F1=1.0000
+2026-04-04 13:25:14  INFO          AUC=1.0000
+2026-04-04 13:25:14  INFO                          precision    recall  f1-score   support
+2026-04-04 13:25:14  INFO               Available       1.00      1.00      1.00      1274
+2026-04-04 13:25:14  INFO               Suspected       1.00      1.00      1.00      6893
+2026-04-04 13:25:14  INFO                      NA       1.00      1.00      1.00      7668
+2026-04-04 13:25:14  INFO                accuracy                           1.00     15835
+2026-04-04 13:25:14  INFO               macro avg       1.00      1.00      1.00     15835
+2026-04-04 13:25:14  INFO            weighted avg       1.00      1.00      1.00     15835
+2026-04-04 13:25:14  INFO      Métriques → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-04-04 13:25:16  ERROR     ERREUR TRAINING : [WinError 5] Accès refusé
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 734, in run_training
+    rsf_model, rsf_preds, rsf_scaler = train_rsf(df_all)   # ✅ récupère le scaler
+                                       ~~~~~~~~~^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 567, in train_rsf
+    rsf.fit(X_tr_scaled, y_rsf[idx_tr])
+    ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\sksurv\ensemble\forest.py", line 184, in fit
+    trees = Parallel(n_jobs=self.n_jobs, verbose=self.verbose, prefer="threads")(
+        delayed(_parallel_build_trees)(
+    ...<11 lines>...
+        for i, t in enumerate(trees)
+    )
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\joblib\parallel.py", line 2070, in __call__
+    next(output)
+    ~~~~^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\joblib\parallel.py", line 1675, in _get_outputs
+    self._start(iterator, pre_dispatch)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\joblib\parallel.py", line 1658, in _start
+    if self.dispatch_one_batch(iterator):
+       ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\joblib\parallel.py", line 1540, in dispatch_one_batch
+    self._dispatch(tasks)
+    ~~~~~~~~~~~~~~^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\joblib\parallel.py", line 1437, in _dispatch
+    job = self._backend.submit(batch, callback=batch_tracker)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\joblib\_parallel_backends.py", line 339, in submit
+    return self._get_pool().apply_async(
+           ~~~~~~~~~~~~~~^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\joblib\_parallel_backends.py", line 507, in _get_pool
+    self._pool = ThreadPool(self._n_jobs)
+                 ~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\nour2\AppData\Local\Programs\Python\Python314\Lib\multiprocessing\pool.py", line 930, in __init__
+    Pool.__init__(self, processes, initializer, initargs)
+    ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\nour2\AppData\Local\Programs\Python\Python314\Lib\multiprocessing\pool.py", line 196, in __init__
+    self._change_notifier = self._ctx.SimpleQueue()
+                            ~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\nour2\AppData\Local\Programs\Python\Python314\Lib\multiprocessing\context.py", line 113, in SimpleQueue
+    return SimpleQueue(ctx=self.get_context())
+  File "C:\Users\nour2\AppData\Local\Programs\Python\Python314\Lib\multiprocessing\queues.py", line 360, in __init__
+    self._reader, self._writer = connection.Pipe(duplex=False)
+                                 ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "C:\Users\nour2\AppData\Local\Programs\Python\Python314\Lib\multiprocessing\connection.py", line 592, in Pipe
+    h2 = _winapi.CreateFile(
+        address, access, 0, _winapi.NULL, _winapi.OPEN_EXISTING,
+        _winapi.FILE_FLAG_OVERLAPPED, _winapi.NULL
+        )
+PermissionError: [WinError 5] Accès refusé
+2026-04-04 13:26:04  INFO      ===== DEBUT TRAINING v7.0.0 =====
+2026-04-04 13:26:10  INFO      MongoDB → 218225 documents chargés
+2026-04-04 13:26:10  INFO      MongoDB → 218225 documents chargés
+2026-04-04 13:26:12  INFO      BLOC 1B — 96528 valides | 121697 rejetés
+2026-04-04 13:26:12  INFO        MSISDN invalide:0 | Date finale invalide:121693
+2026-04-04 13:26:12  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:4
+2026-04-04 13:26:12  INFO      BLOC 1C — 45323 événements normalisés (4→2, 8→2)
+2026-04-04 13:26:13  INFO      BLOC 1C — 79175 MSISDNs uniques
+2026-04-04 13:26:17  INFO      Features → 79175 contacts | labels : {'NA': 38339, 'Suspected': 34467, 'Available': 6369}
+2026-04-04 13:26:17  INFO      Dataset → 79175 contacts | labels={'NA': 38339, 'Suspected': 34467, 'Available': 6369}
+2026-04-04 13:26:17  INFO      Splits XGBoost : train=53839 | val_ES=9501 | test=15835
+2026-04-04 13:26:17  INFO      Features → 41142 contacts | labels : {'Suspected': 40753, 'NA': 306, 'Available': 83}
+2026-04-04 13:26:17  INFO      Optuna disponible → lancement du tuning bayésien (50 trials)...
+2026-04-04 13:26:21  INFO      BLOC 1B — 96528 valides | 121697 rejetés
+2026-04-04 13:26:21  INFO        MSISDN invalide:0 | Date finale invalide:121693
+2026-04-04 13:26:21  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:4
+2026-04-04 13:26:21  INFO      BLOC 1C — 45323 événements normalisés (4→2, 8→2)
+2026-04-04 13:26:22  INFO      BLOC 1C — 79175 MSISDNs uniques
+2026-04-04 13:26:25  INFO      Features → 79175 contacts | labels : {'NA': 38339, 'Suspected': 34467, 'Available': 6369}
+2026-04-04 13:30:49  INFO      Optuna tuning terminé — 50 trials | meilleur F1-macro val=1.0000
+2026-04-04 13:30:49  INFO        Meilleurs hyperparamètres : {'n_estimators': 350, 'max_depth': 7, 'learning_rate': 0.05395030966670229, 'subsample': 0.8095304694689628, 'colsample_bytree': 0.5702083881990965, 'min_child_weight': 3, 'gamma': 0.02904180608409973, 'reg_alpha': 0.4330880728874676, 'reg_lambda': 1.4016725176148133}
+2026-04-04 13:30:56  INFO      XGBoost entraîné — 350 arbres — feature importances :
+2026-04-04 13:30:56  INFO          score_recence                 0.2962
+2026-04-04 13:30:56  INFO          echecs_consecutifs_max        0.2424
+2026-04-04 13:30:56  INFO          taux_livraison_recent         0.1801
+2026-04-04 13:30:56  INFO          taux_livraison                0.1257
+2026-04-04 13:30:56  INFO          jours_depuis_succes           0.0926
+2026-04-04 13:30:56  INFO          freq_inter_envoi_jours        0.0439
+2026-04-04 13:30:56  INFO          total_envois                  0.0191
+2026-04-04 13:30:56  INFO      BLOC 5B — Evaluation XGBoost (test 20%, seed=42, jamais vu) :
+2026-04-04 13:30:56  INFO          N=15835  Acc=1.0000  Prec=1.0000  Rec=1.0000  F1=1.0000
+2026-04-04 13:30:56  INFO          AUC=1.0000
+2026-04-04 13:30:56  INFO                          precision    recall  f1-score   support
+2026-04-04 13:30:56  INFO               Available       1.00      1.00      1.00      1274
+2026-04-04 13:30:56  INFO               Suspected       1.00      1.00      1.00      6893
+2026-04-04 13:30:56  INFO                      NA       1.00      1.00      1.00      7668
+2026-04-04 13:30:56  INFO                accuracy                           1.00     15835
+2026-04-04 13:30:56  INFO               macro avg       1.00      1.00      1.00     15835
+2026-04-04 13:30:56  INFO            weighted avg       1.00      1.00      1.00     15835
+2026-04-04 13:30:56  INFO      Métriques → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-04-04 13:31:42  INFO      RSF — C-index train=1.0000 | eval(honnête)=1.0000
+2026-04-04 13:31:52  INFO      Distribution finale (79175 contacts) :
+2026-04-04 13:31:52  INFO        Available    → 40836  (51.6%)
+2026-04-04 13:31:52  INFO        NA           → 38339  (48.4%)
+2026-04-04 13:31:52  INFO      Modèle v7.0.0 → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (1034 KB)
+2026-04-04 13:31:52  INFO      ===== TRAINING TERMINE (348.8s) =====
+2026-04-04 13:32:33  INFO      MongoDB → 218225 documents chargés
+2026-04-04 13:32:38  INFO      Features → 41142 contacts | labels : {'Suspected': 40753, 'NA': 306, 'Available': 83}
+2026-04-04 13:32:40  INFO      BLOC 1B — 96528 valides | 121697 rejetés
+2026-04-04 13:32:40  INFO        MSISDN invalide:0 | Date finale invalide:121693
+2026-04-04 13:32:40  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:4
+2026-04-04 13:32:40  INFO      BLOC 1C — 45323 événements normalisés (4→2, 8→2)
+2026-04-04 13:32:40  INFO      BLOC 1C — 79175 MSISDNs uniques
+2026-04-04 13:32:42  INFO      Features → 79175 contacts | labels : {'NA': 38339, 'Suspected': 34467, 'Available': 6369}
+2026-04-04 15:01:44  INFO      Features → 2 contacts | labels : {'Available': 2}
+2026-04-04 15:01:44  INFO      BLOC 1B — 3 valides | 1 rejetés
+2026-04-04 15:01:44  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-04 15:01:44  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:1
+2026-04-04 15:01:44  INFO      BLOC 1C — 1 événements normalisés (4→2, 8→2)
+2026-04-04 15:01:44  INFO      BLOC 1C — 1 MSISDNs uniques
+2026-04-04 15:01:44  INFO      BLOC 1B — 1 valides | 0 rejetés
+2026-04-04 15:01:44  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-04 15:01:44  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:0
+2026-04-04 15:01:44  WARNING   MongoDB indisponible (mongo down). Bascule automatique vers JSON: fallback.json
+2026-04-04 15:02:03  INFO      Features → 2 contacts | labels : {'Available': 1, 'Suspected': 1}
+2026-04-04 15:02:03  INFO      BLOC 1B — 3 valides | 1 rejetés
+2026-04-04 15:02:03  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-04 15:02:03  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:1
+2026-04-04 15:02:03  INFO      BLOC 1C — 1 événements normalisés (4→2, 8→2)
+2026-04-04 15:02:03  INFO      BLOC 1C — 1 MSISDNs uniques
+2026-04-04 15:02:03  INFO      BLOC 1B — 1 valides | 0 rejetés
+2026-04-04 15:02:03  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-04 15:02:03  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:0
+2026-04-04 15:02:03  WARNING   MongoDB indisponible (mongo down). Bascule automatique vers JSON: fallback.json
+2026-04-05 00:09:36  INFO      JSON → 138 documents chargés
+2026-04-05 00:09:36  INFO      BLOC 1B — 135 valides | 3 rejetés
+2026-04-05 00:09:36  INFO        MSISDN invalide:0 | Date finale invalide:2
+2026-04-05 00:09:36  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:1
+2026-04-05 00:09:36  INFO      BLOC 1C — 4 événements normalisés (4→2, 8→2)
+2026-04-05 00:09:36  INFO      BLOC 1C — 107 MSISDNs uniques
+2026-04-05 00:10:22  INFO      Features → 2 contacts | labels : {'Available': 1, 'Suspected': 1}
+2026-04-05 00:10:22  INFO      BLOC 1B — 3 valides | 1 rejetés
+2026-04-05 00:10:22  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-05 00:10:22  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:1
+2026-04-05 00:10:22  INFO      BLOC 1C — 1 événements normalisés (4→2, 8→2)
+2026-04-05 00:10:22  INFO      BLOC 1C — 1 MSISDNs uniques
+2026-04-05 00:10:22  INFO      BLOC 1B — 1 valides | 0 rejetés
+2026-04-05 00:10:22  INFO        MSISDN invalide:0 | Date finale invalide:0
+2026-04-05 00:10:22  INFO        Statuts inconnus:0 | SMS finaux dupliquÃ©s:0
+2026-04-05 00:10:22  WARNING   MongoDB indisponible (mongo down). Bascule automatique vers JSON: fallback.json
+2026-04-05 02:17:27  INFO      Exécution immédiate au démarrage...
+2026-04-05 02:17:27  INFO      ===== DEBUT TRAINING v8.0.0 (temporal split, no leakage) =====
+2026-04-05 02:17:27  INFO      JSON → 138 documents chargés
+2026-04-05 02:17:27  INFO       135 valides | 3 rejetés
+2026-04-05 02:17:27  INFO        MSISDN invalide:0 | Date invalide:2
+2026-04-05 02:17:27  INFO        Statuts inconnus:0 | SMS dupliqués:1
+2026-04-05 02:17:27  INFO       4 statuts normalisés (4->2, 8->2)
+2026-04-05 02:17:27  INFO      BLOC 1C — 107 MSISDNs uniques
+2026-04-05 02:17:27  WARNING   Dataset court (39j) — fenêtre future réduite de 30j à 13j
+2026-04-05 02:17:27  INFO      Coupure temporelle : passé=[2025-10-23 → 2025-11-19] | futur=[2025-11-19 → 2025-12-02] (13j de fenêtre future)
+2026-04-05 02:17:27  INFO        21 contact(s) ignoré(s) : aucun événement avant la coupure
+2026-04-05 02:17:28  INFO      Features temporelles → 86 contacts | labels : {'NA': 86}
+2026-04-05 02:17:28  INFO      Dataset → 86 contacts | labels={'NA': 86}
+2026-04-05 02:17:28  ERROR     ERREUR TRAINING : No module named 'sklearn'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 897, in run_training
+    xgb_model, X_test, y_test = train_xgboost(df_all)
+                                ~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 586, in train_xgboost
+    from sklearn.model_selection import GroupShuffleSplit
+ModuleNotFoundError: No module named 'sklearn'
+2026-04-05 02:17:28  INFO      Prochain RE-TRAINING dans 23h 42min
+2026-04-05 02:17:28  INFO      Scheduler actif — training planifié à 02:00
+2026-04-05 02:19:08  INFO      Scheduler arrêté.
+2026-04-05 02:19:10  INFO      Exécution immédiate au démarrage...
+2026-04-05 02:19:10  INFO      ===== DEBUT TRAINING v8.0.0 (temporal split, no leakage) =====
+2026-04-05 02:19:10  INFO      JSON → 138 documents chargés
+2026-04-05 02:19:10  INFO       135 valides | 3 rejetés
+2026-04-05 02:19:10  INFO        MSISDN invalide:0 | Date invalide:2
+2026-04-05 02:19:10  INFO        Statuts inconnus:0 | SMS dupliqués:1
+2026-04-05 02:19:10  INFO       4 statuts normalisés (4->2, 8->2)
+2026-04-05 02:19:10  INFO      BLOC 1C — 107 MSISDNs uniques
+2026-04-05 02:19:10  WARNING   Dataset court (39j) — fenêtre future réduite de 30j à 13j
+2026-04-05 02:19:10  INFO      Coupure temporelle : passé=[2025-10-23 → 2025-11-19] | futur=[2025-11-19 → 2025-12-02] (13j de fenêtre future)
+2026-04-05 02:19:10  INFO        21 contact(s) ignoré(s) : aucun événement avant la coupure
+2026-04-05 02:19:10  INFO      Features temporelles → 86 contacts | labels : {'NA': 86}
+2026-04-05 02:19:10  INFO      Dataset → 86 contacts | labels={'NA': 86}
+2026-04-05 02:19:10  ERROR     ERREUR TRAINING : Dataset trop homogène : une seule classe présente ([np.int64(2)]). Réduisez FUTURE_WINDOW_DAYS ou enrichissez le dataset. Labels courants : {'NA': 86}
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 897, in run_training
+    xgb_model, X_test, y_test = train_xgboost(df_all)
+                                ~~~~~~~~~~~~~^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 596, in train_xgboost
+    raise ValueError(
+    ...<3 lines>...
+    )
+ValueError: Dataset trop homogène : une seule classe présente ([np.int64(2)]). Réduisez FUTURE_WINDOW_DAYS ou enrichissez le dataset. Labels courants : {'NA': 86}
+2026-04-05 02:19:10  INFO      Prochain RE-TRAINING dans 23h 40min
+2026-04-05 02:19:10  INFO      Scheduler actif — training planifié à 02:00
+2026-04-05 02:25:07  INFO      Scheduler arrêté.
+2026-04-05 02:25:10  INFO      Exécution immédiate au démarrage...
+2026-04-05 02:25:10  INFO      ===== DEBUT TRAINING v8.1.0 (adaptive temporal split, no leakage) =====
+2026-04-05 02:25:10  ERROR     ERREUR TRAINING : No module named 'pymongo'
+Traceback (most recent call last):
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 1077, in run_training
+    raw = load_from_mongodb() if CONFIG['USE_MONGODB'] else load_from_json()
+          ~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 87, in load_from_mongodb
+    from pymongo import MongoClient
+ModuleNotFoundError: No module named 'pymongo'
+2026-04-05 02:25:10  INFO      Prochain RE-TRAINING dans 23h 34min
+2026-04-05 02:25:10  INFO      Scheduler actif — training planifié à 02:00
+2026-04-05 02:26:08  INFO      Scheduler arrêté.
+2026-04-05 02:26:11  INFO      Exécution immédiate au démarrage...
+2026-04-05 02:26:11  INFO      ===== DEBUT TRAINING v8.1.0 (adaptive temporal split, no leakage) =====
+2026-04-05 02:26:11  INFO      JSON → 138 documents chargés
+2026-04-05 02:26:11  INFO       135 valides | 3 rejetés
+2026-04-05 02:26:11  INFO        MSISDN invalide:0 | Date invalide:2
+2026-04-05 02:26:11  INFO        Statuts inconnus:0 | SMS dupliqués:1
+2026-04-05 02:26:11  INFO       4 statuts normalisés (4->2, 8->2)
+2026-04-05 02:26:11  INFO      BLOC 1C — 107 MSISDNs uniques
+2026-04-05 02:26:11  WARNING   Dataset court (39j) — fenêtre future réduite de 30j à 13j
+2026-04-05 02:26:11  INFO      Coupure temporelle : passé=[2025-10-23 → 2025-11-19] | futur=[2025-11-19 → 2025-12-02] (13j de fenêtre future)
+2026-04-05 02:26:11  INFO        21 contact(s) ignoré(s) : aucun événement avant la coupure
+2026-04-05 02:26:11  INFO      Features temporelles → 86 contacts | labels : {'NA': 86}
+2026-04-05 02:26:11  WARNING   Coupure globale → 1 classe(s) distincte(s) ({'NA': 86}) — passage au split intra-contact
+2026-04-05 02:26:11  INFO      Split intra-contact (70%/passé) → 107 contacts [13 avec split réel | 94 contact(s) sparse (1 event)] | labels : {'Available': 93, 'Suspected': 10, 'NA': 4}
+2026-04-05 02:26:11  INFO      Stratégie sélectionnée : split intra-contact (per-contact temporal split)
+2026-04-05 02:26:11  INFO      Dataset → 107 contacts | labels={'Available': 93, 'Suspected': 10, 'NA': 4}
+2026-04-05 02:26:11  INFO      Classes présentes dans y : [np.int64(0), np.int64(1), np.int64(2)] (3 classes)
+2026-04-05 02:26:11  INFO      Splits XGBoost (par MSISDN) : train=72 | val_ES=13 | test=22
+2026-04-05 02:26:11  WARNING   Optuna absent → fallback GridSearch partiel
+2026-04-05 02:26:11  INFO      GridSearch fallback terminé | meilleur F1-macro val=1.0000
+2026-04-05 02:26:11  INFO        Meilleurs hyperparamètres : {'n_estimators': 400, 'subsample': 0.8, 'colsample_bytree': 0.75, 'gamma': 0.15, 'reg_alpha': 0.15, 'reg_lambda': 1.2, 'max_depth': 3, 'learning_rate': 0.03, 'min_child_weight': 3}
+2026-04-05 02:26:11  INFO      XGBoost entraîné — 97 arbres — feature importances :
+2026-04-05 02:26:11  INFO          total_envois                  0.0000
+2026-04-05 02:26:11  INFO          taux_livraison                0.0000
+2026-04-05 02:26:11  INFO          echecs_consecutifs_max        0.0000
+2026-04-05 02:26:11  INFO          jours_depuis_succes           0.0000
+2026-04-05 02:26:11  INFO          score_recence                 0.0000
+2026-04-05 02:26:11  INFO          taux_livraison_recent         0.0000
+2026-04-05 02:26:11  INFO          freq_inter_envoi_jours        0.0000
+2026-04-05 02:26:11  INFO      BLOC 5B — Evaluation XGBoost (test 20% MSISDN-level, jamais vu) :
+2026-04-05 02:26:11  INFO          N=22  Acc=0.8182  Prec=0.2727  Rec=0.3333  F1=0.3000
+2026-04-05 02:26:11  INFO          AUC=0.5000
+2026-04-05 02:26:11  INFO                          precision    recall  f1-score   support
+2026-04-05 02:26:11  INFO               Available       0.82      1.00      0.90        18
+2026-04-05 02:26:11  INFO               Suspected       0.00      0.00      0.00         3
+2026-04-05 02:26:11  INFO                      NA       0.00      0.00      0.00         1
+2026-04-05 02:26:11  INFO                accuracy                           0.82        22
+2026-04-05 02:26:11  INFO               macro avg       0.27      0.33      0.30        22
+2026-04-05 02:26:11  INFO            weighted avg       0.67      0.82      0.74        22
+2026-04-05 02:26:11  INFO      Métriques → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-04-05 02:26:11  WARNING   scikit-survival absent → RSF fallback statistique activé
+2026-04-05 02:26:11  INFO      RSF fallback → LogisticRegression calibrée (Platt scaling)
+2026-04-05 02:26:11  INFO      RSF fallback — prob_na_30d : mean=0.054 | std=0.111
+2026-04-05 02:26:11  INFO      Distribution finale (107 contacts) :
+2026-04-05 02:26:11  INFO        Available    →  107  (100.0%)
+2026-04-05 02:26:11  INFO      Modèle v8.1.0 [per_contact_split] → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_availability_model.pkl  (263 KB)
+2026-04-05 02:26:11  INFO      ===== TRAINING TERMINE (0.8s) =====
+2026-04-05 02:26:11  INFO      Prochain RE-TRAINING dans 23h 33min
+2026-04-05 02:26:11  INFO      Scheduler actif — training planifié à 02:00
+2026-04-05 02:30:46  INFO      Scheduler arrêté.
+2026-04-05 16:14:00  INFO      ===== DÉBUT DU PIPELINE DE TRAINING =====
+2026-04-05 16:14:00  ERROR     Fichier JSON introuvable : /home/ubuntu/upload/user_contact(4).json
+2026-04-05 16:14:00  ERROR     Aucune donnée chargée. Fin du pipeline.
+2026-04-05 16:14:10  INFO      ===== DÉBUT DU PIPELINE DE TRAINING =====
+2026-04-05 16:14:10  ERROR     Fichier JSON introuvable : /home/ubuntu/upload/user_contact.json
+2026-04-05 16:14:10  ERROR     Aucune donnée chargée. Fin du pipeline.
+2026-04-05 16:14:15  INFO      ===== DÉBUT DU PIPELINE DE TRAINING =====
+2026-04-05 16:14:15  ERROR     Fichier JSON introuvable : /home/ubuntu/upload/user_contact.json
+2026-04-05 16:14:15  ERROR     Aucune donnée chargée. Fin du pipeline.
+2026-04-05 16:14:38  INFO      ===== DÉBUT DU PIPELINE DE TRAINING =====
+2026-04-05 16:14:38  ERROR     Fichier JSON introuvable : /home/ubuntu/upload/user_contact .json
+2026-04-05 16:14:38  ERROR     Aucune donnée chargée. Fin du pipeline.
+2026-04-05 16:43:44  INFO      ===== DÉBUT DU PIPELINE DE TRAINING =====
+2026-04-05 16:43:48  INFO      MongoDB → 218225 documents chargés
+2026-04-05 16:43:49  INFO      Validation : 100591 valides sur 218225
+2026-04-05 16:43:49  INFO      Traitement : 83209 MSISDNs uniques identifiés
+2026-04-05 16:43:50  INFO      Features générées pour 83209 contacts
+2026-04-05 16:43:51  INFO      Modèle XGBoost entraîné avec succès.
+2026-04-05 16:43:55  INFO      Résultats sauvegardés dans C:\Users\nour2\Downloads\PythonProject\PFE\outputs\contact_predictions.csv
+2026-04-05 16:43:55  INFO      Distribution des décisions : {'NA': 42214, 'Available': 40995}
+2026-04-05 16:43:55  INFO      ===== TRAINING TERMINÉ EN 11.0s =====
+2026-04-06 00:38:23  INFO      Exécution immédiate au démarrage...
+2026-04-06 00:38:23  INFO      ===== DEBUT TRAINING v8.0.0 (temporal split, sans fuite) =====
+2026-04-06 00:38:23  INFO      Validation : 0 événements | 0 docs bruts
+2026-04-06 00:38:23  INFO        MSISDN invalide:0 | Date invalide:0
+2026-04-06 00:38:23  INFO        Statuts inconnus:0 | Doublons:0
+2026-04-06 00:38:23  INFO      Normalisation : 0 statuts convertis (4→2, 8→2)
+2026-04-06 00:38:23  INFO      Groupement : 0 MSISDNs uniques
+2026-04-06 00:38:23  ERROR     Aucun contact valide — arrêt du pipeline.
+2026-04-06 00:38:23  INFO      Prochain RE-TRAINING dans 1h 21min
+2026-04-06 00:38:23  INFO      Scheduler actif — training planifié à 02:00
+2026-04-06 00:40:56  INFO      Exécution immédiate au démarrage...
+2026-04-06 00:40:56  INFO      ===== DEBUT TRAINING v8.0.0 (temporal split, sans fuite) =====
+2026-04-06 00:40:56  INFO      Validation : 0 événements | 0 docs bruts
+2026-04-06 00:40:56  INFO        MSISDN invalide:0 | Date invalide:0
+2026-04-06 00:40:56  INFO        Statuts inconnus:0 | Doublons:0
+2026-04-06 00:40:56  INFO      Normalisation : 0 statuts convertis (4→2, 8→2)
+2026-04-06 00:40:56  INFO      Groupement : 0 MSISDNs uniques
+2026-04-06 00:40:56  ERROR     Aucun contact valide — arrêt du pipeline.
+2026-04-06 00:40:56  INFO      Prochain RE-TRAINING dans 1h 19min
+2026-04-06 00:40:56  INFO      Scheduler actif — training planifié à 02:00
+2026-04-06 00:46:06  INFO      Exécution immédiate au démarrage...
+2026-04-06 00:46:06  INFO      ===== DEBUT TRAINING v8.0.0 (temporal split, sans fuite) =====
+2026-04-06 00:46:06  INFO      Validation : 319 événements | 138 docs bruts
+2026-04-06 00:46:06  INFO        MSISDN invalide:0 | Date invalide:2
+2026-04-06 00:46:06  INFO        Statuts inconnus:0 | Doublons:1
+2026-04-06 00:46:06  INFO      Normalisation : 184 statuts convertis (4→2, 8→2)
+2026-04-06 00:46:06  INFO      Groupement : 107 MSISDNs uniques
+2026-04-06 00:46:06  INFO      Temporal split :
+2026-04-06 00:46:06  INFO        Données disponibles : 2025-10-23 → 2025-12-02
+2026-04-06 00:46:06  INFO        Features calculées  : jusqu'au 2025-11-02
+2026-04-06 00:46:06  INFO        Labels calculés     : 2025-11-02 → 2025-12-02 (30j)
+2026-04-06 00:46:06  INFO      Features → 8 contacts générés
+2026-04-06 00:46:06  INFO      Labels temporels : 8 contacts labellisés | 99 ignorés (pas d'historique passé)
+2026-04-06 00:46:06  INFO        Fenêtre features : jusqu'au 2025-11-02 | Label : 2025-11-02 → 2025-12-02
+2026-04-06 00:46:06  INFO        Distribution labels : {'NA': 6, 'Available': 2}
+2026-04-06 00:46:06  INFO      Merge features+labels : 8 contacts (features=8, labels=8)
+2026-04-06 00:46:06  INFO      Encodage labels : {'NA': 6, 'Available': 2}
+2026-04-06 00:46:06  WARNING   Seulement 8 contacts après merge — résultats peu fiables.
+2026-04-06 00:46:06  WARNING   stratify désactivé : classe minoritaire a seulement 2 exemple(s)
+2026-04-06 00:46:06  INFO      Splits XGBoost : train=5 | val=1 | test=2
+2026-04-06 00:46:06  INFO      Optuna disponible → tuning bayésien (50 trials)...
+2026-04-06 00:46:06  WARNING   Optuna échoué (Invalid classes inferred from unique values of `y`.  Expected: [0 1], got [0 2]) → paramètres par défaut
+2026-04-06 00:46:06  INFO      Paramètres par défaut utilisés
+2026-04-06 00:46:06  ERROR     ERREUR TRAINING : Invalid classes inferred from unique values of `y`.  Expected: [0 1], got [0 2]
+Traceback (most recent call last):
+  File "c:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 875, in run_training
+    xgb_model, X_test, y_test = train_xgboost(df_all)
+                                ~~~~~~~~~~~~~^^^^^^^^
+  File "c:\Users\nour2\Downloads\PythonProject\PFE\train_model.py", line 561, in train_xgboost
+    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+    ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\xgboost\core.py", line 751, in inner_f
+    return func(**kwargs)
+  File "C:\Users\nour2\Downloads\PythonProject\PFE\.venv\Lib\site-packages\xgboost\sklearn.py", line 1761, in fit
+    raise ValueError(
+    ...<2 lines>...
+    )
+ValueError: Invalid classes inferred from unique values of `y`.  Expected: [0 1], got [0 2]
+2026-04-06 00:46:06  INFO      Prochain RE-TRAINING dans 1h 13min
+2026-04-06 00:46:06  INFO      Scheduler actif — training planifié à 02:00
+2026-04-06 14:24:52  INFO      Exécution immédiate au démarrage...
+2026-04-06 14:24:52  INFO      ===== DEBUT TRAINING v7.1.0 (sans fuite, mémoire optimisée) =====
+2026-04-06 14:24:52  INFO       135 valides | 3 rejetés
+2026-04-06 14:24:52  INFO        MSISDN invalide:0 | Date invalide:2
+2026-04-06 14:24:52  INFO        Statuts inconnus:0 | SMS dupliqués:1
+2026-04-06 14:24:52  INFO       4 statuts normalisés (4->2, 8->2)
+2026-04-06 14:24:52  INFO      BLOC 1C — 107 MSISDNs uniques
+2026-04-06 14:24:52  INFO      Date de référence pour l'entraînement : 2025-12-02 10:58:56
+2026-04-06 14:24:52  INFO      Features → 107 contacts | labels : {'Available': 92, 'Suspected': 11, 'NA': 4}
+2026-04-06 14:24:52  INFO      Dataset → 107 contacts | labels={'Available': 92, 'Suspected': 11, 'NA': 4}
+2026-04-06 14:24:52  INFO      Splits XGBoost : train=72 | val_ES=13 | test=22
+2026-04-06 14:24:53  INFO      Optuna disponible → lancement du tuning bayésien (50 trials)...
+2026-04-06 14:25:05  INFO      Optuna tuning terminé — 50 trials | meilleur F1-macro val=1.0000
+2026-04-06 14:25:05  INFO        Meilleurs hyperparamètres : {'n_estimators': 550, 'max_depth': 6, 'learning_rate': 0.03637034060182939, 'subsample': 0.9468439336978197, 'colsample_bytree': 0.8307640198659001, 'min_child_weight': 2, 'gamma': 0.12252460887541555, 'reg_alpha': 0.12408840126362973, 'reg_lambda': 1.2968568772265343}
+2026-04-06 14:25:06  INFO      XGBoost entraîné — 309 arbres — feature importances :
+2026-04-06 14:25:06  INFO          jours_depuis_succes           0.3155
+2026-04-06 14:25:06  INFO          taux_livraison                0.2642
+2026-04-06 14:25:06  INFO          echecs_consecutifs_max        0.2272
+2026-04-06 14:25:06  INFO          score_recence                 0.1930
+2026-04-06 14:25:06  INFO          total_envois                  0.0000
+2026-04-06 14:25:06  INFO          taux_livraison_recent         0.0000
+2026-04-06 14:25:06  INFO          freq_inter_envoi_jours        0.0000
+2026-04-06 14:25:06  INFO      BLOC 5B — Evaluation XGBoost (test 20%, seed=42, jamais vu) :
+2026-04-06 14:25:06  INFO          N=22  Acc=0.9545  Prec=0.9833  Rec=0.8333  F1=0.8803
+2026-04-06 14:25:06  INFO          AUC=0.9775
+2026-04-06 14:25:06  INFO                          precision    recall  f1-score   support
+2026-04-06 14:25:06  INFO               Available       0.95      1.00      0.97        19
+2026-04-06 14:25:06  INFO               Suspected       1.00      0.50      0.67         2
+2026-04-06 14:25:06  INFO                      NA       1.00      1.00      1.00         1
+2026-04-06 14:25:06  INFO                accuracy                           0.95        22
+2026-04-06 14:25:06  INFO               macro avg       0.98      0.83      0.88        22
+2026-04-06 14:25:06  INFO            weighted avg       0.96      0.95      0.95        22
+2026-04-06 14:25:06  INFO      Métriques → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\eval_metrics.json
+2026-04-06 14:25:09  INFO      RSF — C-index train=1.0000 | eval(honnête)=1.0000
+2026-04-06 14:25:09  INFO      Distribution finale (107 contacts) :
+2026-04-06 14:25:09  INFO        Available    →  107  (100.0%)
+2026-04-06 14:25:09  INFO      Modèle v7.1.0 → C:\Users\nour2\Downloads\PythonProject\PFE\outputs\model_assets.joblib  (166 KB)
+2026-04-06 14:25:09  INFO      ===== TRAINING TERMINE (16.7s) =====
+2026-04-06 14:25:09  INFO      Prochain RE-TRAINING dans 11h 34min
+2026-04-06 14:25:09  INFO      Scheduler actif — training planifié à 02:00
